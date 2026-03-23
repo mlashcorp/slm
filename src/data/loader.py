@@ -57,7 +57,8 @@ class MixedPackedDataset(IterableDataset):
                 return chunk, doc_chunk, tok_buf[self.max_len:], doc_buf[self.max_len:], doc_idx
             try:
                 ex = next(it)
-                toks = self.tokenizer.encode(ex[field], add_special_tokens=False)
+                toks = self.tokenizer.encode(ex[field], add_special_tokens=False,
+                                             truncation=False)
                 toks = apply_fim(toks, fim_rate=self.fim_rate,
                                  prefix_id=prefix_id, suffix_id=suffix_id, middle_id=middle_id)
                 toks = toks + [sep_id]

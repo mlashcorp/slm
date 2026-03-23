@@ -1,1 +1,10 @@
-__pycache__/\n*.pyc\n*.pyo\n.venv/\nslm.egg-info/\ndata/\ncheckpoints/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.pytest_cache/
+.playwright-mcp/
+/data/
+/checkpoints/
+/logs/
