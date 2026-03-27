@@ -4,24 +4,27 @@ High-throughput downloader for smollm-corpus python-edu.
 Fetches actual Python source code from the Software Heritage S3 bucket
 (public, anonymous access) using a ThreadPoolExecutor for I/O concurrency.
 
+Saves incrementally to parquet shards (10K files per shard) to minimize
+memory usage and allow resumption.
+
 Usage:
-    # Full dataset (~7.68M files, hours outside AWS)
-    python scripts/download_python_edu.py
+# Full dataset (~7.68M files, hours outside AWS)
+python scripts/download_python_edu.py
 
-    # Quick end-to-end test (~5 min outside AWS)
-    python scripts/download_python_edu.py --sample 10000
+# Quick end-to-end test (~5 min outside AWS)
+python scripts/download_python_edu.py --sample 10000
 
-    # Custom concurrency
-    python scripts/download_python_edu.py --sample 10000 --num-workers 128
+# Custom concurrency
+python scripts/download_python_edu.py --sample 10000 --num-workers 128
 
-    # Resume interrupted download (skips already-fetched blob_ids)
-    python scripts/download_python_edu.py --resume
+# Resume interrupted download (skips existing shards)
+python scripts/download_python_edu.py --resume
 
 Options:
-    --sample N        Download only the first N rows (default: full dataset)
-    --num-workers N   Concurrent S3 threads (default: 256)
-    --output DIR      Output directory (default: ./data/python_edu_hydrated)
-    --resume          Skip blob_ids already present in output dataset
+--sample N      Download only the first N rows (default: full dataset)
+--num-workers N Concurrent S3 threads (default: 256)
+--output DIR    Output directory (default: ./data/python_edu_hydrated)
+--resume        Skip shards already present in output directory
 """
 import argparse
 import gzip
@@ -38,9 +41,9 @@ from datasets import Dataset, load_dataset, load_from_disk
 from tqdm import tqdm
 
 BUCKET = "softwareheritage"
+SHARD_SIZE = 10_000
 
-# Anonymous access — no AWS credentials needed.
-# max_pool_connections must exceed num_workers or boto3 serializes connections.
+
 def make_s3_client(num_workers: int) -> boto3.client:
     return boto3.client(
         "s3",
@@ -78,31 +81,35 @@ def download(
 ) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    shards_dir = output_path / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resume: load already-fetched blob_ids so we can skip them
-    done_ids: set[str] = set()
-    resume_ds = None
-    if resume and (output_path / "dataset_info.json").exists():
-        print("Resuming — loading existing dataset...")
-        resume_ds = load_from_disk(str(output_path))
-        done_ids = set(resume_ds["blob_id"])
-        print(f"  Already downloaded: {len(done_ids):,} files")
+    blob_ids = list(metadata_ds["blob_id"])
+    start_shard_idx = 0
 
-    blob_ids = metadata_ds["blob_id"]
-    if done_ids:
-        blob_ids = [b for b in blob_ids if b not in done_ids]
+    if resume:
+        existing_shards = sorted(shards_dir.glob("shard-*.parquet"))
+        if existing_shards:
+            start_shard_idx = len(existing_shards)
+            last_shard = Dataset.from_parquet(str(existing_shards[-1]))
+            done_ids = set(last_shard["blob_id"])
+            blob_ids = [b for b in blob_ids if b not in done_ids]
+            print(f"Resuming from shard {start_shard_idx} ({len(existing_shards)} shards exist)")
+            if blob_ids:
+                print(f"Remaining files to download: {len(blob_ids):,}")
+
     total = len(blob_ids)
-    print(f"Files to download: {total:,} (workers: {num_workers})")
-
     if total == 0:
         print("Nothing to do.")
         return
 
-    s3 = make_s3_client(num_workers)
+    print(f"Files to download: {total:,} (workers: {num_workers})")
 
+    s3 = make_s3_client(num_workers)
     rows: list[dict] = []
     failed = 0
-    # Submit in batches so we don't pre-allocate millions of Future objects at once.
+    current_shard_idx = start_shard_idx
+    files_in_current_shard = 0
     BATCH = num_workers * 4
 
     with tqdm(total=total, unit="file", dynamic_ncols=True) as pbar:
@@ -115,32 +122,27 @@ def download(
                     rows.append(result)
                     if not result["download_success"]:
                         failed += 1
+                    files_in_current_shard += 1
                     pbar.update(1)
-                    pbar.set_postfix(failed=failed, refresh=False)
+                    pbar.set_postfix(shard=current_shard_idx, failed=failed)
 
-    # Merge with any previously downloaded data
-    new_ds = Dataset.from_list(rows)
-    if resume_ds is not None:
-        from datasets import concatenate_datasets
-        # Drop reference to resume_ds before saving to avoid overwrite conflict
-        merged = concatenate_datasets([resume_ds, new_ds])
-        del resume_ds
-    else:
-        merged = new_ds
+                    if files_in_current_shard >= SHARD_SIZE:
+                        shard_path = shards_dir / f"shard-{current_shard_idx:06d}.parquet"
+                        shard_ds = Dataset.from_list(rows)
+                        shard_ds.to_parquet(str(shard_path))
+                        rows = []
+                        files_in_current_shard = 0
+                        current_shard_idx += 1
+                        pbar.set_postfix(shard=current_shard_idx, failed=failed)
 
-    success_ds = merged.filter(lambda x: x["download_success"])
+    if rows:
+        shard_path = shards_dir / f"shard-{current_shard_idx:06d}.parquet"
+        shard_ds = Dataset.from_list(rows)
+        shard_ds.to_parquet(str(shard_path))
+        current_shard_idx += 1
 
-    # Save to a temp path first, then replace, so we never overwrite the source
-    import shutil
-    tmp_path = output_path.parent / (output_path.name + "_tmp")
-    if tmp_path.exists():
-        shutil.rmtree(tmp_path)
-    success_ds.save_to_disk(str(tmp_path))
-    if output_path.exists():
-        shutil.rmtree(output_path)
-    shutil.move(str(tmp_path), str(output_path))
-
-    print(f"\nDone. {len(success_ds):,} files saved to {output_path}")
+    total_shards = current_shard_idx
+    print(f"\nDone. {total_shards} shards saved to {shards_dir}")
     print(f"Failed (NoSuchKey): {failed:,}")
 
 
@@ -153,7 +155,7 @@ def main():
     parser.add_argument("--output", type=str, default="./data/python_edu_hydrated",
                         help="Output directory (default: ./data/python_edu_hydrated)")
     parser.add_argument("--resume", action="store_true",
-                        help="Skip blob_ids already present in output dataset")
+                        help="Skip shards already present in output directory")
     args = parser.parse_args()
 
     print("Loading python-edu metadata from HuggingFace...")

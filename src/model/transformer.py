@@ -3,7 +3,8 @@ import torch.nn as nn
 from src.model.config import ModelConfig
 from src.model.norm import RMSNorm
 from src.model.block import TransformerBlock
-from src.model.rope import precompute_freqs_cis
+from src.model.rope import precompute_freqs_cos_sin
+from src.model.attention import doc_ids_to_cu_seqlens
 
 
 class Transformer(nn.Module):
@@ -18,11 +19,11 @@ class Transformer(nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(config.head_dim, config.max_position_embeddings, theta=config.rope_theta),
-            persistent=False,
+        cos, sin = precompute_freqs_cos_sin(
+            config.head_dim, config.max_position_embeddings, theta=config.rope_theta
         )
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         self._init_weights()
 
@@ -37,16 +38,11 @@ class Transformer(nn.Module):
 
     @staticmethod
     def build_doc_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Causal mask that also blocks cross-document attention.
-        doc_ids: (batch, seq_len)
-        Returns float additive mask (batch, 1, seq_len, seq_len):
-            0.0 where attention is allowed, -inf elsewhere.
-        """
+        """SDPA fallback: (B, 1, S, S) float additive mask."""
         B, S = doc_ids.shape
-        same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)    # (B, S, S)
+        same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
         causal = torch.ones(S, S, device=doc_ids.device, dtype=torch.bool).tril()
-        mask = same_doc & causal.unsqueeze(0)                       # (B, S, S)
+        mask = same_doc & causal.unsqueeze(0)
         float_mask = torch.zeros(B, 1, S, S, device=doc_ids.device)
         float_mask.masked_fill_(~mask.unsqueeze(1), float("-inf"))
         return float_mask
@@ -58,14 +54,24 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         B, S = input_ids.shape
         x = self.embed_tokens(input_ids)
-        freqs = self.freqs_cis[:S]
-        attn_mask = self.build_doc_mask(doc_ids) if doc_ids is not None else None
+        cos = self.rope_cos[:S]
+        sin = self.rope_sin[:S]
+
+        cu_seqlens = None
+        max_seqlen = None
+        attn_mask = None
+        if doc_ids is not None:
+            if self.config.use_flash_attn:
+                cu_seqlens, max_seqlen = doc_ids_to_cu_seqlens(doc_ids)
+            else:
+                attn_mask = self.build_doc_mask(doc_ids)
 
         for layer in self.layers:
-            x = layer(x, freqs, attn_mask=attn_mask)
+            x = layer(x, cos, sin, attn_mask=attn_mask, cu_seqlens=cu_seqlens,
+                      max_seqlen=max_seqlen)
 
         x = self.norm(x)
-        return self.lm_head(x)     # (batch, seq_len, vocab_size)
+        return self.lm_head(x)
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         params = (p for p in self.parameters() if not trainable_only or p.requires_grad)

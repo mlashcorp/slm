@@ -1,13 +1,28 @@
 """
 Mixed dataloader: streams python-edu and fineweb-edu at a 50/50 ratio,
 applies FIM, packs to context length, and yields batches.
+
+Supports both Arrow format (load_from_disk) and parquet shards.
 """
 import random
-from datasets import load_from_disk
+from pathlib import Path
+from datasets import load_dataset, load_from_disk
 from torch.utils.data import IterableDataset, DataLoader
 import torch
 from src.data.tokenizer import load_tokenizer, FIM_TOKENS
 from src.data.fim import apply_fim
+
+
+def _load_dataset(path: str):
+    """Load dataset from path, supporting both Arrow and parquet shards."""
+    p = Path(path)
+    if (p / "shards").exists():
+        return load_dataset(
+            "parquet",
+            data_files=str(p / "shards" / "*.parquet"),
+            split="train",
+        )
+    return load_from_disk(path)
 
 
 class MixedPackedDataset(IterableDataset):
@@ -27,12 +42,12 @@ class MixedPackedDataset(IterableDataset):
         self.tokenizer = load_tokenizer()
 
     def __iter__(self):
-        # Offset seed per worker so each worker produces a distinct data stream
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed + (worker_info.id if worker_info is not None else 0)
         rng = random.Random(seed)
-        py_ds = load_from_disk(self.python_edu_path)
-        fw_ds = load_from_disk(self.fineweb_edu_path)
+
+        py_ds = _load_dataset(self.python_edu_path)
+        fw_ds = _load_dataset(self.fineweb_edu_path)
 
         py_iter = iter(py_ds.shuffle(seed=self.seed))
         fw_iter = iter(fw_ds.shuffle(seed=self.seed))
@@ -57,10 +72,8 @@ class MixedPackedDataset(IterableDataset):
                 return chunk, doc_chunk, tok_buf[self.max_len:], doc_buf[self.max_len:], doc_idx
             try:
                 ex = next(it)
-                toks = self.tokenizer.encode(ex[field], add_special_tokens=False,
-                                             truncation=False)
-                toks = apply_fim(toks, fim_rate=self.fim_rate,
-                                 prefix_id=prefix_id, suffix_id=suffix_id, middle_id=middle_id)
+                toks = self.tokenizer.encode(ex[field], add_special_tokens=False, truncation=False)
+                toks = apply_fim(toks, fim_rate=self.fim_rate, prefix_id=prefix_id, suffix_id=suffix_id, middle_id=middle_id)
                 toks = toks + [sep_id]
                 tok_buf.extend(toks)
                 doc_buf.extend([doc_idx] * len(toks))
@@ -72,26 +85,25 @@ class MixedPackedDataset(IterableDataset):
         while True:
             source = rng.choice(["python", "fineweb"])
 
+            chunk = None
+            doc_chunk = None
             if source == "python":
-                chunk = None
                 while chunk is None:
                     prev = len(py_buf)
                     chunk, doc_chunk, py_buf, py_doc_buf, py_doc_idx = next_tokens(
                         py_iter, py_buf, py_doc_buf, py_doc_idx, "text")
                     if chunk is None and len(py_buf) <= prev:
-                        break  # iterator exhausted, no progress
-                if chunk is None:
-                    break
+                        break
             else:
-                chunk = None
                 while chunk is None:
                     prev = len(fw_buf)
                     chunk, doc_chunk, fw_buf, fw_doc_buf, fw_doc_idx = next_tokens(
                         fw_iter, fw_buf, fw_doc_buf, fw_doc_idx, "text")
                     if chunk is None and len(fw_buf) <= prev:
-                        break  # iterator exhausted, no progress
-                if chunk is None:
-                    break
+                        break
+
+            if chunk is None:
+                break
 
             yield {
                 "input_ids": torch.tensor(chunk, dtype=torch.long),
@@ -107,10 +119,10 @@ def make_dataloader(
     fim_rate: float = 0.5,
     num_workers: int = 4,
     seed: int = 42,
-    val_split: float = 0.01,  # hold out 1% of python-edu as validation
+    val_split: float = 0.01,
 ) -> tuple[DataLoader, DataLoader]:
     """Returns (train_loader, val_loader). Val is ~1% of python-edu, no FIM."""
-    py_ds = load_from_disk(python_edu_path)
+    py_ds = _load_dataset(python_edu_path)
     split = py_ds.train_test_split(test_size=val_split, seed=seed)
     train_py_path = python_edu_path + "_train_split"
     val_py_path = python_edu_path + "_val_split"
@@ -128,11 +140,9 @@ def make_dataloader(
         python_edu_path=val_py_path,
         fineweb_edu_path=fineweb_edu_path,
         max_len=max_len,
-        fim_rate=0.0,   # no FIM on validation — cleaner perplexity signal
+        fim_rate=0.0,
         seed=seed,
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size,
-                            num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=False, persistent_workers=num_workers > 0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=False, persistent_workers=num_workers > 0)
     return train_loader, val_loader

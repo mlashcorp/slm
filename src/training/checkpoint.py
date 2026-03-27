@@ -1,6 +1,8 @@
 import torch
 from pathlib import Path
 
+from src.data.tokenizer import load_tokenizer
+
 
 def save_checkpoint(
     model,
@@ -39,6 +41,7 @@ def save_hf_format(model, config, output_dir: str):
     """
     Save in HuggingFace LlamaForCausalLM format so lm-eval-harness can load it.
     Weight names are remapped to match the HF Llama module hierarchy.
+    Also saves tokenizer files for lm-eval compatibility.
     """
     from transformers import LlamaConfig
 
@@ -71,4 +74,13 @@ def save_hf_format(model, config, output_dir: str):
         # lm_head stays as-is
         remapped[new_k] = v
 
+    # When embeddings are tied, drop lm_head.weight — HF reconstructs it from
+    # model.embed_tokens.weight at load time. Keeping both causes a warning.
+    if config.tie_embeddings:
+        remapped.pop("lm_head.weight", None)
+
     torch.save(remapped, Path(output_dir) / "pytorch_model.bin")
+
+    # Save tokenizer for lm-eval compatibility
+    tokenizer = load_tokenizer()
+    tokenizer.save_pretrained(output_dir)

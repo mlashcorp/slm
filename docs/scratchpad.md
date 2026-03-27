@@ -773,6 +773,24 @@ pass@1 = 0.0  (greedy decoding, n=1)
 
 Expected: greedy pass@1 for small models is typically 0 or near-0. Official SmolLM2-135M HumanEval numbers use temperature sampling with n=200 samples. Our trained models will be evaluated the same way (greedy, n=1) for a fair apples-to-apples comparison across checkpoints.
 
+**Eval pipeline review (2026-03-23):**
+
+Two bugs found and fixed in `scripts/evaluate.py`:
+- Missing `--device cuda` — was defaulting to CPU (extremely slow)
+- Missing `dtype=bfloat16` in `model_args` — was loading in float32, mismatching training precision
+
+Fixed command now includes: `dtype=bfloat16`, `--device cuda`, `--batch_size 16`.
+
+Verified end-to-end against smoke test checkpoint (`step-00000050`): 164 HumanEval problems completed in ~3 minutes, pass@1 = 0 as expected for untrained model.
+
+Also fixed a warning in `checkpoint.py` (`save_hf_format`): when `tie_embeddings=True`, `lm_head.weight` is now dropped from `pytorch_model.bin`. Previously both `lm_head.weight` and `model.embed_tokens.weight` were saved, causing transformers to warn "both are present in checkpoints, will NOT tie them." HF reconstructs `lm_head.weight` from `embed_tokens.weight` automatically when `tie_word_embeddings=True`.
+
+**SmolLM eval tool clarification:**
+SmolLM uses **lighteval** for general benchmarks (HellaSwag, ARC, PIQA, MMLU, etc.) and **bigcode-evaluation-harness** for HumanEval specifically — not lm-eval-harness. However, SmolLM is a general model; we are building a Python code model, so HumanEval + MBPP via lm-eval-harness is the correct choice for our use case.
+
+**Eval methodology note:**
+`humaneval` task uses greedy decoding (`do_sample=False, repeats=1`), computing pass@1. This is cheaper than the official SmolLM evaluation (temperature=0.2, n=200 samples) and will produce lower absolute numbers, but is consistent across checkpoints — which is what matters for tracking training progress.
+
 ---
 
 ### Step 3 — Dataset Download (2026-03-21)
@@ -804,3 +822,231 @@ The plan stated "FIM tokens are already in its vocabulary" — this is **incorre
 
 Also updated "Decisions Made":
 - ~~SmolLM2 49K BPE~~ → SmolLM2 49K BPE + 4 FIM tokens = **49156 vocab**
+
+---
+
+### Step 5 — RoPE: switch to rotate_half for torch.compile compatibility (2026-03-23)
+
+**Problem:** The original RoPE implementation used `torch.polar` + `torch.view_as_complex`, which triggered:
+```
+UserWarning: Torchinductor does not support code generation for complex operators.
+Performance may be worse than eager.
+```
+This means `torch.compile` was falling back to eager for the RoPE ops while still allocating compilation buffers — worst of both worlds.
+
+**Two real-arithmetic options researched:**
+
+| Option | Convention | Pairing | Used by |
+|--------|-----------|---------|---------|
+| A (interleaved) | `(d0,d1), (d2,d3)...` | Consecutive | Meta Llama 3, torchtitan `complex` backend |
+| B (rotate_half) | `(d0, d_{D/2})...` | Split-half | HuggingFace Transformers, LitGPT, torchtitan `cos_sin` backend |
+
+**Decision: Option B (rotate_half).** Rationale:
+- Starting from scratch — no checkpoint compatibility concern
+- Aligns with HuggingFace ecosystem (we save in HF LlamaForCausalLM format)
+- Dominant convention in new open-source models (Llama, Mistral, Qwen, SmolLM2)
+- No native `nn.RoPE` in PyTorch 2.8 — must implement manually either way
+
+**Changes made:**
+- `rope.py`: replaced `precompute_freqs_cis` (returns complex tensor) with `precompute_freqs_cos_sin` (returns `(cos, sin)` real tensors of shape `(seq_len, head_dim)`)
+- `attention.py`: `forward(x, freqs_cis)` → `forward(x, cos, sin)`
+- `block.py`: `forward(x, freqs_cis)` → `forward(x, cos, sin)`
+- `transformer.py`: buffers `rope_cos`/`rope_sin` replace `freqs_cis`
+- `tests/test_model.py`: all RoPE call sites updated
+
+All 35 tests passing after change.
+
+### Step 6 — Throughput Optimization (2026-03-24)
+
+**Goal:** Improve on 62K tok/s baseline (compile + doc_mask, batch=8, grad_accum=16, 2048 seq).
+
+**Baseline measurements (pre-optimization):**
+| Config | tok/s (step ~50) | VRAM |
+|--------|-----------------|------|
+| compile=True, use_doc_mask=True | 62K | 26.7 GB |
+| compile=True, use_doc_mask=False | 92K | — |
+| compile=False, use_doc_mask=False | OOM | — |
+
+Doc mask was the bottleneck: `(B,1,S,S)` float mask forces SDPA math backend → materializes `(8,9,2048,2048)` attention scores = ~18 GB across 30 layers.
+
+**flash_attn_varlen_func (intra-doc masking, O(S) memory):**
+- `doc_ids_to_cu_seqlens(doc_ids)` converts `(B,S)` doc ids → `(total_docs+1,)` int32 CSR-style cumulative lengths + `max_seqlen` Python int
+- Flash attention processes each document as an independent sequence — cross-doc attention physically impossible, not masked
+- `max_seqlen` returned from `doc_ids_to_cu_seqlens` as a plain Python int (avoids `.item()` graph break inside compiled model)
+- Signature chain: `transformer.forward(doc_ids)` → `doc_ids_to_cu_seqlens` → `(cu_seqlens, max_seqlen)` → `block.forward(cu_seqlens, max_seqlen)` → `attention.forward(cu_seqlens, max_seqlen)`
+
+**CUDAGraphs incompatibility with varlen:**
+- `torch.compile(mode="max-autotune", dynamic=False)` enables CUDAGraphs
+- CUDAGraphs requires static tensor shapes — `cu_seqlens` shape varies per batch (different doc counts)
+- `doc_ids_to_cu_seqlens` uses Python loops → graph break → model splits into sub-graphs
+- Second sub-graph (transformer layers) fails: "accessing tensor output of CUDAGraphs that has been overwritten"
+- Fix: `mode="max-autotune-no-cudagraphs"` — keeps Triton kernel autotuning, eliminates CUDAGraphs constraint
+
+**Other throughput wins applied:**
+- AdamW `fused=True`
+- `zero_grad(set_to_none=True)`
+- `non_blocking=True` on tensor transfers to GPU
+- `persistent_workers=True` in DataLoader
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+
+**Final benchmark (2026-03-24, compile + flash_attn_varlen + all wins):**
+| Step | tok/s |
+|------|-------|
+| 50   | 74K   |
+| 100  | 90K   |
+| 150  | 96K   |
+| 200  | 100K  |
+
+Throughput improves as compile warms up (kernel cache fills). Steady-state ~100K tok/s with intra-doc masking active — matches no-mask baseline from prior run (92K). Doc masking is now effectively free.
+
+**Estimate for 2000-step checkpoint:** ~262K tok/step → 2000 steps = 524M tokens. At 100K tok/s: ~5250 seconds (~1.5 hours).
+
+### Step 7 — DataLoader Bus Error Investigation (2026-03-24)
+
+**Symptom:** `DataLoader worker killed by signal: Bus error` at step ~250. Error message suggests insufficient `/dev/shm` but that was ruled out (16GB available, 356KB used).
+
+**Investigation:**
+- `/dev/shm`: 16GB, ~0% used — not the cause
+- `dmesg`: no OOM kill events — kernel did not kill the worker
+- VRAM: 23.3GB / 32GB (BF16 run, down from 26.7GB pre-flash_attn_varlen)
+- `vm/max_map_count`: 1,048,576 — well above default 65,530, not a factor
+- fineweb_edu has 102 Arrow shards; python_edu has 6
+
+**Most likely root cause:** `load_from_disk` is called inside `__iter__` (not `__init__`). With `persistent_workers=True`, workers stay alive across epochs and call `__iter__` again on restart — reopening all Arrow shard mmaps without closing the previous ones. fineweb_edu's 102 shards × 4 workers × multiple restarts = mmap accumulation in worker virtual address space. Combined with `pin_memory=True` + `persistent_workers=True` (known PyTorch interaction issue, #48370), this degrades over time until SIGBUS.
+
+**Fix applied:**
+- `num_workers`: 4 → 2 (GPU-bound at 99%, data pipeline not the bottleneck)
+- `pin_memory`: True → False (eliminates pin_memory/persistent_workers interaction)
+
+**Note:** `persistent_workers=True` retained — still reduces worker startup overhead between epochs. The mmap accumulation is mitigated by halving worker count.
+
+**Update (2026-03-24):** Re-ran without applying the fix — training reached step 800+ without crashing. Confirms the failure is **non-deterministic** (depends on data order, OS page cache state, or scheduler timing). The fix is still prudent as a precaution but the root cause may be a rare race condition rather than a guaranteed resource accumulation.
+
+### Step 8 — FP8 Training Ablation Setup (2026-03-24)
+
+**Goal:** Compare BF16 vs FP8 throughput and loss for Phase 1 135M over 2000 steps.
+
+**Initial FP8 run — extremely slow (10.6K tok/s at step 50):**
+Root cause: torchao 0.16.0 was installed but its C++ extensions are incompatible with torch 2.8.0+cu128:
+```
+Skipping import of cpp extensions due to incompatible torch version 2.8.0+cu128 for torchao version 0.16.0
+```
+Without C++ extensions, every FP8 linear layer requires 4-5 separate Python-dispatched kernel launches (compute amax → compute scale → cast input to FP8 → cast weight to FP8 → `_scaled_mm`) instead of a single fused kernel. With 30 layers × 4 projections = 120 linears, this causes ~500 extra kernel launches per forward pass vs BF16.
+
+**Second issue — `_scaled_mm` dimension error:**
+```
+RuntimeError: Expected self.size(1) to be divisible by 16, but got self.size(1)=16376
+```
+Cause: `B * S = 8 * 2047 = 16376` (sequence is shifted by 1 for next-token prediction), and `16376 % 16 = 8`. FP8 `_scaled_mm` requires the K dimension divisible by 16.
+Fix: `Float8LinearConfig(pad_inner_dim=True)` — pads K to nearest multiple of 16.
+
+**Resolution:**
+- Downgraded torchao 0.16.0 → **0.13.0** (built against torch 2.8.0 — primary match per pytorch/ao#2919)
+- C++ extensions now load cleanly (no warning)
+- `pad_inner_dim=True` retained
+- All 35 tests pass
+
+**FP8 config:** `Float8LinearConfig(pad_inner_dim=True)`, tensorwise dynamic scaling, lm_head excluded (tied embeddings), `convert_to_float8_training` called before `torch.compile`.
+
+---
+
+### Step 9 — FP8 Throughput Investigation & Blackwell Research (2026-03-24)
+
+**Observation:** FP8 training shows lower throughput than BF16 baseline:
+- FP8 at step 600: ~68K tok/s (batch=10)
+- BF16 at step 2000: ~100K tok/s (batch=8)
+- FP8 at step 600+: rising to ~81K tok/s (still warming up)
+
+**Root cause analysis:** torchao 0.13.0 uses **tensorwise** scaling by default, which is the older recipe. Newer versions support **rowwise** scaling with 34-43% speedup.
+
+---
+
+#### Blackwell FP8 Research Summary
+
+**Key findings from NVIDIA blog, torchao docs, and GitHub issues:**
+
+**1. torchao Version Compatibility (pytorch/ao#2919):**
+
+| torchao version | Built against torch | Also supports |
+|-----------------|---------------------|---------------|
+| 0.13.0 (current) | 2.8.0 | 2.8.0, 2.7.1, 2.6.0 |
+| 0.16.0 | 2.10.0 | 2.10.0, 2.9.0, 2.8.0 |
+| 0.17.0dev (nightly) | 2.11.0dev | 2.10.0, 2.9.0, 2.8.0 |
+
+**2. FP8 Scaling Recipes:**
+
+| Recipe | Speedup | Notes |
+|--------|---------|-------|
+| tensorwise (current) | Baseline | Older, simpler |
+| **rowwise** | 34-43% | Recommended default |
+| rowwise_with_gw_hp | Lower | Keeps weight grads in BF16 for sensitive workloads |
+
+**3. Blackwell (RTX 5090) FP8 Support:**
+
+| Feature | Status |
+|---------|--------|
+| Native FP8 (E4M3/E5M2) | ✓ Supported |
+| MXFP8 (32-element blocks) | ✓ Supported |
+| NVFP4 (16-element blocks) | ✓ Supported, **7x faster GEMM** |
+| CUDA required | 12.8+ |
+
+**Note:** NVFP4 is still in research phase (validated on 12B model, 10T tokens). Current torchao FP8 uses standard FP8, not NVFP4.
+
+**4. Unsloth Blackwell Benchmarks (NVIDIA blog, Oct 2025):**
+
+On RTX 5090 with 32GB VRAM:
+- 2x faster training throughput
+- 70% VRAM reduction
+- 12x longer context windows
+- Supports fine-tuning, RL, and pretraining
+
+**Note:** Unsloth uses custom Triton kernels optimized for Blackwell (SM 12.0). FP8 support available. QAT integration with TorchAO.
+
+**5. Alternative FP8 Libraries:**
+
+| Library | Version | Notes |
+|---------|---------|-------|
+| NVIDIA Transformer Engine | v2.12 | Battle-tested, Blackwell-optimized, MXFP8/NVFP4 support |
+| MS-AMP (Microsoft) | v0.4.0 | FP8-LM paper, less mature |
+
+---
+
+#### Recommended Actions
+
+| Priority | Action | Expected Benefit |
+|----------|--------|------------------|
+| 1 | Upgrade `torchao` to 0.16.0+ | Access to rowwise scaling, better Blackwell support |
+| 2 | Use rowwise FP8 recipe | 30-40% speedup over tensorwise |
+| 3 | Keep `torch.compile` enabled | 15-30% additional speedup |
+| 4 | Consider Transformer Engine | Alternative if torchao issues persist |
+| 5 | Upgrade torch to 2.10.0+ | Better Blackwell support (may require flash-attn rebuild) |
+
+**Code change for rowwise scaling (torchao 0.16.0+):**
+
+```python
+from torchao.float8 import Float8LinearConfig, ScalingType, ScalingGranularity
+
+fp8_config = Float8LinearConfig(
+    scaling_type=ScalingType.DYNAMIC,
+    scaling_granularity=ScalingGranularity.PER_ROW,  # rowwise
+    pad_inner_dim=True,
+)
+convert_to_float8_training(model, config=fp8_config, module_filter_fn=_fp8_filter)
+```
+
+**Upgrade path:**
+- Option A: Stay on torch 2.8.0, upgrade torchao to 0.16.0 (supported)
+- Option B: Upgrade both torch to 2.10.0+ and torchao to 0.16.0 (best Blackwell support, may require flash-attn rebuild)
+- Option C: Continue with current BF16 baseline, revisit FP8 after pretraining completes
+
+**Constraint:** torch 2.10 had flash-attn wheel incompatibility — required downgrade to torch 2.8.0 (see Step 1). If upgrading torch, may need to rebuild flash-attn from source or wait for compatible wheel.
+
+---
+
+#### Dataloader Worker Experiment (2026-03-24)
+
+**Changes made:**
+- `num_workers`: 2 → 4 in `src/data/loader.py`
+- Batch size: 8 → 10 in `scripts/train.py` (batch=16 caused OOM)
+
+**Result:** FP8 throughput still lower than BF16, but improving as compile warms up. Need to wait until step 2000 for fair comparison.

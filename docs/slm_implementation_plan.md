@@ -1,6 +1,6 @@
 # SLM Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Train a Python-specialized small language model in three phases: a 135M proxy model (Phase 1, ~2 days) for fast pipeline validation, an optional 360M intermediate model (Phase 2, ~4 days), and a 2B target model (Phase 3, ~28–44 days). Evals established before training begins.
 
@@ -55,7 +55,7 @@ slm/
 
 ### Task 0.1: Install dependencies
 
-- [ ] **Step 1: Create requirements.txt**
+- [x] **Step 1: Create requirements.txt**
 
 ```
 torch>=2.4.0
@@ -70,13 +70,13 @@ tqdm
 wandb
 ```
 
-- [ ] **Step 2: Install**
+- [x] **Step 2: Install**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-- [ ] **Step 3: Verify Flash Attention installed correctly**
+- [x] **Step 3: Verify Flash Attention installed correctly**
 
 ```bash
 python -c "import flash_attn; print(flash_attn.__version__)"
@@ -84,13 +84,13 @@ python -c "import flash_attn; print(flash_attn.__version__)"
 
 Expected: version string printed (≥2.5.0). If this fails, Flash Attention needs to be built from source for Blackwell: `pip install flash-attn --no-build-isolation`
 
-- [ ] **Step 4: Verify bitsandbytes can see the GPU**
+- [x] **Step 4: Verify bitsandbytes can see the GPU**
 
 ```bash
 python -c "import bitsandbytes as bnb; print(bnb.__version__)"
 ```
 
-- [ ] **Step 5: Create package structure and pyproject.toml**
+- [x] **Step 5: Create package structure and pyproject.toml**
 
 ```bash
 mkdir -p src/model src/data src/training src/eval
@@ -125,13 +125,13 @@ pip install -e .
 
 This task sets up and validates lm-eval-harness against a known public model before writing any training code. The goal is to confirm the eval pipeline works and establish baseline numbers to compare against.
 
-- [ ] **Step 1: Verify lm-eval-harness is installed and working**
+- [x] **Step 1: Verify lm-eval-harness is installed and working**
 
 ```bash
 lm_eval --help
 ```
 
-- [ ] **Step 2: Run HumanEval against SmolLM2-135M as a sanity check**
+- [x] **Step 2: Run HumanEval against SmolLM2-135M as a sanity check**
 
 This will take ~5–10 minutes and confirms the eval pipeline end-to-end. SmolLM2-135M is the same architecture as our Phase 1 target so this also gives us a direct comparison baseline.
 
@@ -145,7 +145,7 @@ lm_eval \
   --output_path ./evals/baseline_smollm2_135m.json
 ```
 
-- [ ] **Step 3: Create eval wrapper script**
+- [x] **Step 3: Create eval wrapper script**
 
 Create `scripts/evaluate.py`:
 
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add requirements.txt scripts/evaluate.py evals/
@@ -198,7 +198,7 @@ git commit -m "feat: add eval harness setup and baseline SmolLM2-135M results"
 
 ### Task 1.1: Download datasets
 
-- [ ] **Step 1: Create download script**
+- [x] **Step 1: Create download script**
 
 Create `scripts/download_data.py`:
 
@@ -236,7 +236,7 @@ fw.save_to_disk("./data/fineweb_edu")
 print(f"fineweb-edu: {len(fw):,} examples")
 ```
 
-- [ ] **Step 2: Run the download** (this may take 30–60 minutes depending on connection)
+- [x] **Step 2: Run the download** (this may take 30–60 minutes depending on connection)
 
 ```bash
 python scripts/download_data.py
@@ -248,7 +248,7 @@ python-edu: ~4,000,000 examples
 fineweb-edu: ~10,000,000 examples
 ```
 
-- [ ] **Step 3: Verify data on disk**
+- [x] **Step 3: Verify data on disk**
 
 ```bash
 du -sh data/python_edu data/fineweb_edu
@@ -256,7 +256,7 @@ du -sh data/python_edu data/fineweb_edu
 
 Expected: python-edu ~644 MB, fineweb-edu ~28 GB.
 
-- [ ] **Step 4: Commit the download script** (not the data)
+- [x] **Step 4: Commit the download script** (not the data)
 
 ```bash
 echo "data/" >> .gitignore
@@ -268,7 +268,7 @@ git commit -m "feat: add dataset download script"
 
 ### Task 1.2: Tokenizer setup
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Create `tests/test_tokenizer.py`:
 
@@ -291,7 +291,7 @@ def test_vocab_size():
     assert tok.vocab_size == 49152
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 pytest tests/test_tokenizer.py -v
@@ -299,7 +299,7 @@ pytest tests/test_tokenizer.py -v
 
 Expected: ImportError or AttributeError — `src/data/tokenizer.py` doesn't exist yet.
 
-- [ ] **Step 3: Implement tokenizer.py**
+- [x] **Step 3: Implement tokenizer.py**
 
 Create `src/data/tokenizer.py`:
 
@@ -324,13 +324,13 @@ def load_tokenizer(model_id: str = "HuggingFaceTB/SmolLM2-360M"):
     return tok
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 pytest tests/test_tokenizer.py -v
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/data/tokenizer.py tests/test_tokenizer.py
@@ -343,7 +343,7 @@ git commit -m "feat: add tokenizer loader with FIM token validation"
 
 50% of training examples are rearranged as Fill-in-Middle. Each example either stays as CLM (causal left-to-right) or is transformed into PSM or SPM format.
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Create `tests/test_fim.py`:
 
@@ -394,13 +394,13 @@ def test_fim_rate():
     assert 0.45 < fim_count / N < 0.55
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 pytest tests/test_fim.py -v
 ```
 
-- [ ] **Step 3: Implement fim.py**
+- [x] **Step 3: Implement fim.py**
 
 Create `src/data/fim.py`:
 
@@ -456,13 +456,13 @@ def apply_fim(
         return [suffix_id] + suffix + [prefix_id] + prefix + [middle_id] + middle
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 pytest tests/test_fim.py -v
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/data/fim.py tests/test_fim.py
@@ -475,7 +475,7 @@ git commit -m "feat: add FIM transformation (PSM + SPM modes, 50% rate)"
 
 Short documents are concatenated (with an `<|endoftext|>` separator) to fill the context window. This avoids wasting compute on padding.
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Create `tests/test_pack.py`:
 
@@ -503,13 +503,13 @@ def test_long_sequence_truncated():
         assert len(chunk) == 10
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 pytest tests/test_pack.py -v
 ```
 
-- [ ] **Step 3: Implement pack.py**
+- [x] **Step 3: Implement pack.py**
 
 Create `src/data/pack.py`:
 
@@ -616,13 +616,13 @@ def pack_dataset_streaming(
             doc_id_buffer = doc_id_buffer[max_len:]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 pytest tests/test_pack.py -v
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/data/pack.py tests/test_pack.py
@@ -633,7 +633,7 @@ git commit -m "feat: add greedy sequence packing with FIM integration"
 
 ### Task 1.5: DataLoader
 
-- [ ] **Step 1: Implement loader.py**
+- [x] **Step 1: Implement loader.py**
 
 Create `src/data/loader.py`:
 
@@ -781,7 +781,7 @@ def make_dataloader(
     return train_loader, val_loader
 ```
 
-- [ ] **Step 2: Smoke test the dataloader manually**
+- [x] **Step 2: Smoke test the dataloader manually**
 
 ```bash
 python -c "
@@ -794,7 +794,7 @@ print('Unique docs in seq 0:', batch['doc_ids'][0].unique().numel())  # expect s
 "
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/data/loader.py
@@ -807,7 +807,7 @@ git commit -m "feat: add mixed 50/50 dataloader with streaming and FIM"
 
 ### Task 2.1: Model config
 
-- [ ] **Step 1: Implement config.py**
+- [x] **Step 1: Implement config.py**
 
 Create `src/model/config.py`:
 
@@ -885,7 +885,7 @@ class ModelConfig:
         )
 ```
 
-- [ ] **Step 2: Verify param counts match expectations**
+- [x] **Step 2: Verify param counts match expectations**
 
 ```bash
 python -c "
@@ -904,7 +904,7 @@ print(f'Phase 3  (2B):  {count_params(ModelConfig.phase3_2b())/1e6:.0f}M')     #
 "
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/model/config.py
@@ -915,7 +915,7 @@ git commit -m "feat: add ModelConfig for Phase 1 (135M), Phase 2 (360M), Phase 3
 
 ### Task 2.2: RMSNorm
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 In `tests/test_model.py`:
 
@@ -937,13 +937,13 @@ def test_rmsnorm_scale():
     assert torch.allclose(out, torch.ones_like(out), atol=1e-5)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 pytest tests/test_model.py::test_rmsnorm_shape tests/test_model.py::test_rmsnorm_scale -v
 ```
 
-- [ ] **Step 3: Implement norm.py**
+- [x] **Step 3: Implement norm.py**
 
 Create `src/model/norm.py`:
 
@@ -963,7 +963,7 @@ class RMSNorm(nn.Module):
         return x * rms * self.weight
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 pytest tests/test_model.py::test_rmsnorm_shape tests/test_model.py::test_rmsnorm_scale -v
@@ -973,7 +973,7 @@ pytest tests/test_model.py::test_rmsnorm_shape tests/test_model.py::test_rmsnorm
 
 ### Task 2.3: RoPE
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Add to `tests/test_model.py`:
 
@@ -999,7 +999,7 @@ def test_rope_preserves_norm():
     assert torch.allclose(q.norm(dim=-1), q_rot.norm(dim=-1), atol=1e-5)
 ```
 
-- [ ] **Step 2: Implement rope.py**
+- [x] **Step 2: Implement rope.py**
 
 Create `src/model/rope.py`:
 
@@ -1044,7 +1044,7 @@ def apply_rotary_emb(
     return q_rot.to(q.dtype), k_rot.to(k.dtype)
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 ```bash
 pytest tests/test_model.py -v -k "rope"
@@ -1054,7 +1054,7 @@ pytest tests/test_model.py -v -k "rope"
 
 ### Task 2.4: GQA Attention
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Add to `tests/test_model.py`:
 
@@ -1087,7 +1087,7 @@ def test_gqa_causal_mask():
     assert torch.allclose(out1[0, :4], out2[0, :4], atol=1e-4)
 ```
 
-- [ ] **Step 2: Implement attention.py**
+- [x] **Step 2: Implement attention.py**
 
 Create `src/model/attention.py`:
 
@@ -1165,7 +1165,7 @@ class GroupedQueryAttention(nn.Module):
         return self.o_proj(out)
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 ```bash
 pytest tests/test_model.py -v -k "gqa"
@@ -1175,7 +1175,7 @@ pytest tests/test_model.py -v -k "gqa"
 
 ### Task 2.5: SwiGLU FFN
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Add to `tests/test_model.py`:
 
@@ -1189,7 +1189,7 @@ def test_swiglu_shape():
     assert out.shape == x.shape
 ```
 
-- [ ] **Step 2: Implement mlp.py**
+- [x] **Step 2: Implement mlp.py**
 
 Create `src/model/mlp.py`:
 
@@ -1213,7 +1213,7 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 ```
 
-- [ ] **Step 3: Run test**
+- [x] **Step 3: Run test**
 
 ```bash
 pytest tests/test_model.py::test_swiglu_shape -v
@@ -1223,7 +1223,7 @@ pytest tests/test_model.py::test_swiglu_shape -v
 
 ### Task 2.6: TransformerBlock
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Add to `tests/test_model.py`:
 
@@ -1241,7 +1241,7 @@ def test_block_shape():
     assert out.shape == x.shape
 ```
 
-- [ ] **Step 2: Implement block.py**
+- [x] **Step 2: Implement block.py**
 
 Create `src/model/block.py`:
 
@@ -1276,7 +1276,7 @@ class TransformerBlock(nn.Module):
         return self._forward(x, freqs_cis, attn_mask)
 ```
 
-- [ ] **Step 3: Run test**
+- [x] **Step 3: Run test**
 
 ```bash
 pytest tests/test_model.py::test_block_shape -v
@@ -1286,7 +1286,7 @@ pytest tests/test_model.py::test_block_shape -v
 
 ### Task 2.7: Full Transformer model
 
-- [ ] **Step 1: Write test**
+- [x] **Step 1: Write test**
 
 Add to `tests/test_model.py`:
 
@@ -1313,13 +1313,13 @@ def test_tied_embeddings():
     assert model.embed_tokens.weight is model.lm_head.weight, "Embeddings not tied"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 pytest tests/test_model.py -v -k "transformer"
 ```
 
-- [ ] **Step 3: Implement transformer.py**
+- [x] **Step 3: Implement transformer.py**
 
 Create `src/model/transformer.py`:
 
@@ -1402,7 +1402,7 @@ class Transformer(nn.Module):
         return sum(p.numel() for p in params)
 ```
 
-- [ ] **Step 4: Run all model tests**
+- [x] **Step 4: Run all model tests**
 
 ```bash
 pytest tests/test_model.py -v
@@ -1410,7 +1410,7 @@ pytest tests/test_model.py -v
 
 All tests should pass. The param count test is the critical one — it confirms the architecture matches spec.
 
-- [ ] **Step 5: Commit all model code**
+- [x] **Step 5: Commit all model code**
 
 ```bash
 git add src/model/
@@ -1423,7 +1423,7 @@ git commit -m "feat: implement full transformer architecture (GQA, SwiGLU, RMSNo
 
 ### Task 3.1: LR schedules
 
-- [ ] **Step 1: Implement schedule.py**
+- [x] **Step 1: Implement schedule.py**
 
 Create `src/training/schedule.py`:
 
@@ -1454,7 +1454,7 @@ def wsd_lr(step: int, warmup_steps: int, stable_steps: int, decay_steps: int, ma
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 ```
 
-- [ ] **Step 2: Quick sanity check**
+- [x] **Step 2: Quick sanity check**
 
 ```bash
 python -c "
@@ -1470,7 +1470,7 @@ for step in [0, 500, 1000, 16000, 32000]:
 
 ### Task 3.2: Checkpoint save/load
 
-- [ ] **Step 1: Implement checkpoint.py**
+- [x] **Step 1: Implement checkpoint.py**
 
 Create `src/training/checkpoint.py`:
 
@@ -1563,7 +1563,7 @@ def save_hf_format(model, config, output_dir: str):
 
 > **Note:** The weight remapping in `save_hf_format` maps our module names to LlamaForCausalLM names so lm-eval can load the checkpoint via `--model hf`. Verify this mapping once a first checkpoint is saved.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add src/training/schedule.py src/training/checkpoint.py
@@ -1574,7 +1574,7 @@ git commit -m "feat: add LR schedules (cosine + WSD) and checkpoint save/load"
 
 ### Task 3.3: Training loop (Phase 1)
 
-- [ ] **Step 1: Implement trainer.py**
+- [x] **Step 1: Implement trainer.py**
 
 Create `src/training/trainer.py`:
 
@@ -1746,7 +1746,7 @@ class Trainer:
         print(f"Training complete. Total steps: {self.global_step}, tokens seen: {tokens_seen:,}")
 ```
 
-- [ ] **Step 2: Create train entry point**
+- [x] **Step 2: Create train entry point**
 
 Create `scripts/train.py`:
 
@@ -1880,7 +1880,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/training/trainer.py scripts/train.py
@@ -1895,7 +1895,7 @@ git commit -m "feat: add training loop and train.py entry point"
 
 Before starting the full 16B token run, verify the training loop runs without errors for 50 steps.
 
-- [ ] **Step 1: Run smoke test**
+- [x] **Step 1: Run smoke test**
 
 ```bash
 python scripts/train.py --phase 1
@@ -1915,14 +1915,14 @@ step    100 | loss 8.5xxx | lr 1.00e-04 | gnorm 0.xxx | 92.5K tok/s
 
 Note: LR is low during warmup. It reaches the max (1e-3) at step 1000 then stays flat until the WSD decay phase. The 135M model should run significantly faster than 360M (~80–100K tok/s vs ~40–50K tok/s).
 
-- [ ] **Step 2: Verify checkpoint saves correctly**
+- [x] **Step 2: Verify checkpoint saves correctly**
 
 ```bash
 ls ./checkpoints/phase1/
 # Should see: step-00000500/checkpoint.pt and step-00000500/pytorch_model.bin
 ```
 
-- [ ] **Step 3: Run eval on the (untrained) checkpoint to confirm eval pipeline works end-to-end**
+- [x] **Step 3: Run eval on the (untrained) checkpoint to confirm eval pipeline works end-to-end**
 
 ```bash
 python scripts/evaluate.py \

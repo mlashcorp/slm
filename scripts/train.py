@@ -5,8 +5,12 @@ Usage:
   python scripts/train.py --phase 1
   python scripts/train.py --phase 2 --resume ./checkpoints/phase1/step-00061035
 """
+import os
 import argparse
 import torch
+
+# Reduce allocator fragmentation — set before any CUDA allocation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from src.model.config import ModelConfig
 from src.model.transformer import Transformer
 from src.data.loader import make_dataloader
@@ -14,7 +18,7 @@ from src.training.trainer import Trainer
 from src.training.checkpoint import load_checkpoint
 
 # Steps = 16B tokens / (batch_size * seq_len * grad_accum)
-# Phase 1: 16 * 2048 * 8  = 262,144 tok/step → 61,035 steps
+# Phase 1:  8 * 2048 * 16 = 262,144 tok/step → 61,035 steps
 # Phase 2:  8 * 2048 * 8  = 131,072 tok/step → 122,070 steps
 # Phase 3:  2 * 4096 * 16 = 131,072 tok/step → 122,070 steps
 
@@ -29,12 +33,16 @@ PHASE1_CONFIG = {
     "decay_steps": 8_000,
     "total_steps": 61_035,
     "schedule": "wsd",
-    "grad_accum_steps": 8,
+    "grad_accum_steps": 16,
     "use_8bit_adam": False,
     "compile": True,
+    "use_doc_mask": True,
     "log_every": 50,
     "save_every": 2_000,
     "output_dir": "./checkpoints/phase1",
+    "wandb_enabled": True,
+    "wandb_project": "slm",
+    "wandb_run_name": "phase1-135m",
 }
 
 PHASE2_CONFIG = {
@@ -54,6 +62,9 @@ PHASE2_CONFIG = {
     "log_every": 50,
     "save_every": 2_000,
     "output_dir": "./checkpoints/phase2",
+    "wandb_enabled": False,
+    "wandb_project": "slm",
+    "wandb_run_name": "phase2-360m",
 }
 
 PHASE3_CONFIG = {
@@ -73,21 +84,27 @@ PHASE3_CONFIG = {
     "log_every": 50,
     "save_every": 2_000,
     "output_dir": "./checkpoints/phase3",
+    "wandb_enabled": False,
+    "wandb_project": "slm",
+    "wandb_run_name": "phase3-2b",
 }
 
 PHASE_CONFIGS = {1: PHASE1_CONFIG, 2: PHASE2_CONFIG, 3: PHASE3_CONFIG}
 PHASE_MODELS = {
-    1: (ModelConfig.phase1_135m, 2048, 16),
+    1: (ModelConfig.phase1_135m, 2048, 10),
     2: (ModelConfig.phase2_360m, 2048, 8),
-    3: (ModelConfig.phase3_2b,   4096, 2),
+    3: (ModelConfig.phase3_2b, 4096, 2),
 }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], required=True)
+    parser.add_argument("--fp8", action="store_true", help="Enable FP8 training (requires Blackwell/H100+)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint dir to resume from")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Override total_steps (useful for quick tests)")
     parser.add_argument("--python-edu-path", type=str,
                         default="./data/python_edu_hydrated")
     parser.add_argument("--fineweb-edu-path", type=str,
@@ -96,7 +113,13 @@ def main():
 
     model_fn, seq_len, batch_size = PHASE_MODELS[args.phase]
     model_cfg = model_fn()
-    train_cfg = PHASE_CONFIGS[args.phase]
+    train_cfg = dict(PHASE_CONFIGS[args.phase])
+    if args.fp8:
+        train_cfg["use_fp8"] = True
+        train_cfg["output_dir"] = train_cfg["output_dir"] + "-fp8"
+        train_cfg["wandb_run_name"] = train_cfg["wandb_run_name"] + "-fp8"
+    if args.steps is not None:
+        train_cfg["total_steps"] = args.steps
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")

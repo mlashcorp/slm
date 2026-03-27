@@ -19,19 +19,28 @@ class TransformerBlock(nn.Module):
     def _forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), freqs_cis, attn_mask=attn_mask)
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin,
+                               attn_mask=attn_mask, cu_seqlens=cu_seqlens,
+                               max_seqlen=max_seqlen)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor:
         if self.use_grad_ckpt and self.training:
-            return checkpoint(self._forward, x, freqs_cis, attn_mask, use_reentrant=False)
-        return self._forward(x, freqs_cis, attn_mask)
+            return checkpoint(self._forward, x, cos, sin, attn_mask, cu_seqlens,
+                              max_seqlen, use_reentrant=False)
+        return self._forward(x, cos, sin, attn_mask, cu_seqlens, max_seqlen)

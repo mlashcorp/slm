@@ -113,6 +113,21 @@ step   100 | loss 7.83 | lr 1.00e-03 | gnorm 1.10 | 28.3K tok/s
 
 Initial loss should be near `ln(49156) ≈ 10.8` and decrease steadily. The WSD schedule holds LR constant for the bulk of training then applies a cosine decay in the final ~13% of steps.
 
+**W&B logging** is disabled by default. To enable:
+
+1. Get your API key from **wandb.ai → Settings → API keys**, then login:
+   ```bash
+   # Interactive (prompts for key)
+   wandb login
+
+   # Non-interactive
+   wandb login <your-api-key>
+
+   # Or via env var (no persistent storage)
+   export WANDB_API_KEY=<your-api-key>
+   ```
+2. Set `"wandb_enabled": True` in the relevant phase config in `scripts/train.py`.
+
 ## Evaluation
 
 ```bash

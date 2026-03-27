@@ -35,6 +35,7 @@ class ModelConfig:
             head_dim=64,
             max_position_embeddings=2048,
             rope_theta=100_000.0,
+            use_flash_attn=True,
         )
 
     @classmethod

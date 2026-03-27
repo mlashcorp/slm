@@ -5,6 +5,26 @@ from src.model.config import ModelConfig
 from src.model.rope import apply_rotary_emb
 
 
+def doc_ids_to_cu_seqlens(doc_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """
+    Convert (B, S) doc_ids into cu_seqlens for flash_attn_varlen_func.
+    Documents must be contiguous within each batch row.
+    Returns (cu_seqlens, max_seqlen) where cu_seqlens is int32 of shape
+    (total_docs + 1,) and max_seqlen is a plain Python int.
+    """
+    B, S = doc_ids.shape
+    cu = [0]
+    for b in range(B):
+        row = doc_ids[b]
+        boundaries = torch.cat([row.new_tensor([True]), row[1:] != row[:-1]])
+        starts = torch.where(boundaries)[0]
+        lengths = torch.diff(torch.cat([starts, row.new_tensor([S])]))
+        for l in lengths.tolist():
+            cu.append(cu[-1] + int(l))
+    max_seqlen = max(cu[i + 1] - cu[i] for i in range(len(cu) - 1))
+    return torch.tensor(cu, dtype=torch.int32, device=doc_ids.device), max_seqlen
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -24,8 +44,11 @@ class GroupedQueryAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                        # (batch, seq, hidden)
-        freqs_cis: torch.Tensor,                # (seq, head_dim // 2) complex
+        cos: torch.Tensor,                      # (seq, head_dim)
+        sin: torch.Tensor,                      # (seq, head_dim)
         attn_mask: torch.Tensor | None = None,  # (batch, 1, seq, seq) float additive
+        cu_seqlens: torch.Tensor | None = None, # (total_docs+1,) int32 — varlen path
+        max_seqlen: int | None = None,          # max doc length (Python int, avoids .item() graph break)
     ) -> torch.Tensor:
         B, S, _ = x.shape
 
@@ -33,15 +56,33 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim)
 
-        q, k = apply_rotary_emb(q, k, freqs_cis)
+        q, k = apply_rotary_emb(q, k, cos, sin)
 
-        if self.use_flash and attn_mask is None:
+        # flash_attn_varlen_func: packed sequences, O(S) memory, native GQA support
+        if self.use_flash and cu_seqlens is not None:
+            from flash_attn import flash_attn_varlen_func
+            q_flat = q.reshape(B * S, self.n_heads, self.head_dim)
+            k_flat = k.reshape(B * S, self.n_kv_heads, self.head_dim)
+            v_flat = v.reshape(B * S, self.n_kv_heads, self.head_dim)
+            out_flat = flash_attn_varlen_func(
+                q_flat, k_flat, v_flat,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=True,
+            )
+            out = out_flat.view(B, S, self.n_heads * self.head_dim)
+
+        # flash_attn_func: no doc masking, causal only
+        elif self.use_flash and attn_mask is None:
             from flash_attn import flash_attn_func
-            k = k.repeat_interleave(self.n_groups, dim=2)
-            v = v.repeat_interleave(self.n_groups, dim=2)
-            out = flash_attn_func(q, k, v, causal=True)
+            k_exp = k.repeat_interleave(self.n_groups, dim=2)
+            v_exp = v.repeat_interleave(self.n_groups, dim=2)
+            out = flash_attn_func(q, k_exp, v_exp, causal=True).reshape(B, S, self.n_heads * self.head_dim)
+
+        # SDPA fallback (used when flash_attn not available)
         else:
-            # Standard SDPA — transpose to (B, H, S, D)
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
@@ -51,7 +92,6 @@ class GroupedQueryAttention(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
             else:
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            out = out.transpose(1, 2)   # (B, S, H, D)
+            out = out.transpose(1, 2).reshape(B, S, self.n_heads * self.head_dim)
 
-        out = out.reshape(B, S, self.n_heads * self.head_dim)
         return self.o_proj(out)
