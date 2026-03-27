@@ -268,7 +268,7 @@ def evaluate(
     print(f"Loading model from {checkpoint_path}...")
     model, config = load_model(checkpoint_path, device)
 
-    print(f"\nModel: depth={config.depth}, hidden={config.hidden_size}")
+    print(f"\nModel: n_layer={config.n_layer}, n_embd={config.n_embd}")
     print(f"Parameters: {model.num_parameters():,}")
 
     print(f"\nEvaluating on {len(tasks)} tasks (max {max_samples} samples each)...")

@@ -1,51 +1,125 @@
 """
-NanoChat model configuration — aligned with karpathy/nanogpt GPTConfig.
+NanoChat model configuration -- aligned with karpathy/nanoGPT GPTConfig.
 
-Reference: https://github.com/karpathy/nanogpt
+Reference: https://github.com/karpathy/nanoGPT
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class NanoChatConfig:
-    """GPT configuration, matching karpathy/nanogpt field names.
+    """GPT configuration using karpathy/nanoGPT field names.
 
-    Preset configs use our smaller sizes designed for fast training
-    on a single GPU, not the full GPT-2 sizes.
+    Core fields (matching nanoGPT):
+        block_size, vocab_size, n_layer, n_head, n_embd, dropout, bias
+
+    Extended fields for nanochat features:
+        n_kv_head, rope_theta, window_pattern, and use_* feature flags.
     """
-    block_size: int = 1024       # sequence / context length
-    vocab_size: int = 50304      # r50k_base (50257) padded to multiple of 64
+
+    # --- Core (nanoGPT-compatible) ---
+    block_size: int = 1024
+    vocab_size: int = 50304       # r50k_base (50257) padded to multiple of 64
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    dropout: float = 0.0         # 0 for pretraining, try 0.1 for fine-tuning
-    bias: bool = False           # no bias in Linears or LayerNorms (slightly better)
+    dropout: float = 0.0
+    bias: bool = False
 
-    @classmethod
-    def d12(cls) -> "NanoChatConfig":
-        """~85M params — quick validation config."""
-        return cls(n_layer=12, n_head=12, n_embd=768)
+    # --- Extended architecture ---
+    n_kv_head: int = 0            # 0 means n_kv_head = n_head (MHA)
+    intermediate_size: int = 0    # 0 means 4 * n_embd
+    rope_theta: float = 100_000.0
 
-    @classmethod
-    def d24(cls) -> "NanoChatConfig":
-        """~350M params — GPT-2 medium scale."""
-        return cls(n_layer=24, n_head=16, n_embd=1024)
+    # Sliding window attention: "SSSL" = Short-Short-Short-Long
+    window_pattern: str = "SSSL"
 
-    @classmethod
-    def d26(cls) -> "NanoChatConfig":
-        """~774M params — GPT-2 large scale."""
-        return cls(n_layer=36, n_head=20, n_embd=1280)
+    # --- Feature flags ---
+    use_value_embeds: bool = True
+    use_attn_gate: bool = True
+    use_resid_lambdas: bool = True
+    use_post_lambdas: bool = True
+    use_x0_lambdas: bool = True
+    use_sa_lambdas: bool = True
+    use_smear: bool = True
+    use_backout: bool = True
+    use_skip_connection: bool = True
+    use_bigram_embeds: bool = True
+
+    # --- Feature parameters ---
+    smear_gate_channels: int = 12
+    skip_source_layer: int = 3
+    skip_target_layer: int = 6
+    bigram_vocab_size: int = 32768
 
     def __post_init__(self):
         assert self.n_embd % self.n_head == 0, \
             f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
 
+        if self.n_kv_head == 0:
+            self.n_kv_head = self.n_head
+
+        if self.intermediate_size == 0:
+            self.intermediate_size = 4 * self.n_embd
+
+        assert self.n_embd % self.n_kv_head == 0, \
+            f"n_embd ({self.n_embd}) must be divisible by n_kv_head ({self.n_kv_head})"
+
+    @property
+    def head_dim(self) -> int:
+        return self.n_embd // self.n_head
+
+    @classmethod
+    def d12(cls) -> "NanoChatConfig":
+        """~12M params -- quick validation config."""
+        return cls(n_layer=12, n_head=6, n_embd=384)
+
+    @classmethod
+    def d24(cls) -> "NanoChatConfig":
+        """~50M params -- GPT-2 level."""
+        return cls(n_layer=24, n_head=4, n_embd=512)
+
+    @classmethod
+    def d26(cls) -> "NanoChatConfig":
+        """~60M params -- beat GPT-2."""
+        return cls(n_layer=26, n_head=5, n_embd=640)
+
     def num_parameters(self) -> dict:
-        """Rough parameter count estimate."""
-        h, v, d = self.n_embd, self.vocab_size, self.n_layer
+        """Rough parameter count estimate.
+
+        Returns dict with component-level counts for optimizer group sizing.
+        """
+        h = self.n_embd
+        v = self.vocab_size
+        d = self.n_layer
+        ff = self.intermediate_size
+        kv_dim = self.n_kv_head * self.head_dim
+
         wte = v * h
-        wpe = self.block_size * h
-        attn = d * (3 * h * h + h * h)   # QKV + O
-        mlp = d * (h * 4 * h + 4 * h * h)  # fc + proj
-        total = wte + wpe + attn + mlp
-        return {"wte": wte, "wpe": wpe, "attn": attn, "mlp": mlp, "total": total}
+        lm_head = v * h  # untied
+
+        # Per-layer: Q + K + V + O projections
+        attn_per_layer = (
+            h * (self.n_head * self.head_dim)      # Q
+            + h * (self.n_kv_head * self.head_dim)  # K
+            + h * (self.n_kv_head * self.head_dim)  # V
+            + (self.n_head * self.head_dim) * h      # O
+        )
+        attn = d * attn_per_layer
+
+        # Per-layer: MLP up + down
+        mlp = d * (h * ff + ff * h)
+
+        # Transformer matrices (used for optimizer group sizing)
+        transformer_matrices = attn + mlp
+
+        total = wte + lm_head + transformer_matrices
+
+        return {
+            "wte": wte,
+            "lm_head": lm_head,
+            "transformer_matrices": transformer_matrices,
+            "attn": attn,
+            "mlp": mlp,
+            "total": total,
+        }
