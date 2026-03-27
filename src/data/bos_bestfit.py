@@ -108,11 +108,11 @@ class Tokenizer:
             # Load custom tokenizer
             self._tokenizer = tiktoken.load(str(tokenizer_path))
         else:
-            # Use GPT-4's tokenizer as default
-            self._tokenizer = tiktoken.get_encoding("cl100k_base")
+            # Use GPT-2's tokenizer (r50k_base, 50257 tokens) — matches vocab_size=50304
+            self._tokenizer = tiktoken.get_encoding("r50k_base")
 
         # Special tokens
-        self._bos_token = "<|endoftext|>"  # BOS is same as EOS for GPT-4
+        self._bos_token = "<|endoftext|>"  # BOS is same as EOS for GPT-2
         self._eos_token = "<|endoftext|>"
         self._bos_id = self._tokenizer.encode_single_token(self._bos_token)
         self._eos_id = self._tokenizer.encode_single_token(self._eos_token)
@@ -127,7 +127,7 @@ class Tokenizer:
 
     def get_vocab_size(self) -> int:
         """Get vocabulary size."""
-        return self._tokenizer.nvocab
+        return self._tokenizer.n_vocab
 
     def encode(
         self,
@@ -216,7 +216,7 @@ def best_fit_data_loader(
 
     def refill_buffer():
         """Refill document buffer from parquet files."""
-        nonlocal current_file_idx, current_rg_idx
+        nonlocal current_file_idx, current_rg_idx, doc_iter
 
         try:
             documents, (current_file_idx, current_rg_idx) = next(doc_iter)

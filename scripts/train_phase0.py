@@ -76,7 +76,7 @@ def get_lr_multiplier(step: int, warmup_steps: int, num_iterations: int, warmdow
 def get_momentum(step: int, num_iterations: int, warmdown_ratio: float) -> float:
     """Compute momentum for Muon optimizer.
 
-    Momentum warms up to 0.97, then warms down to 0.90 during LR warmdown.
+    Momentum warms up to 0.95 over 300 steps, then warms down to 0.85 during LR warmdown.
 
     Args:
         step: Current step
@@ -89,16 +89,16 @@ def get_momentum(step: int, num_iterations: int, warmdown_ratio: float) -> float
     warmdown_steps = round(warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_steps
 
-    if step < 400:
-        # Warmup to 0.97
-        frac = step / 400
-        return (1 - frac) * 0.85 + frac * 0.97
+    if step < 300:
+        # Warmup to 0.95 over 300 steps
+        frac = step / 300
+        return (1 - frac) * 0.85 + frac * 0.95
     elif step >= warmdown_start:
-        # Warmdown to 0.90
+        # Warmdown to 0.85
         progress = (step - warmdown_start) / warmdown_steps
-        return 0.97 * (1 - progress) + 0.90 * progress
+        return 0.95 * (1 - progress) + 0.85 * progress
     else:
-        return 0.97
+        return 0.95
 
 
 # =============================================================================
@@ -110,7 +110,8 @@ def train(args):
 
     # Device setup
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(device) if args.device == "cuda" else None
+    if torch.cuda.is_available() and args.device == "cuda":
+        torch.cuda.set_device(0)
 
     print(f"Using device: {device}")
     print(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'N/A'}")
@@ -194,6 +195,10 @@ def train(args):
 
     optimizer = MuonAdamW(param_groups)
 
+    # Store initial_lr so the schedule multiplier applies to the original LR (not a running product)
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+
     print(f"  Parameter groups: {len(param_groups)}")
     for i, group in enumerate(param_groups):
         print(f"    Group {i}: kind={group['kind']}, lr={group.get('lr', 'N/A')}")
@@ -227,6 +232,7 @@ def train(args):
         num_iterations = int(target_tokens // tokens_per_step)
 
     total_tokens = num_iterations * args.batch_size * config.sequence_len
+    scaling_params = param_counts["transformer_matrices"] + param_counts["lm_head"]
 
     print(f"\nTraining configuration:")
     print(f"  Total iterations: {num_iterations:,}")
@@ -290,8 +296,9 @@ def train(args):
         # Backward pass
         loss.backward()
 
-        # Optimizer step
-        optimizer.step()
+        # Optimizer step: Adam only on odd steps
+        do_adam = (step % 2 == 1)
+        optimizer.step(do_adam=do_adam)
         model.zero_grad(set_to_none=True)
 
         t1 = time.perf_counter()
@@ -385,18 +392,18 @@ def main():
     parser.add_argument("--momentum", type=float, default=0.95, help="Momentum (Muon)")
     parser.add_argument("--warmup-steps", type=int, default=40, help="Warmup steps")
     parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="Warmdown ratio")
-    parser.add_argument("--final-lr-frac", type=float, default=0.05, help="Final LR fraction")
+    parser.add_argument("--final-lr-frac", type=float, default=0.15, help="Final LR fraction")
 
     # Compute
     parser.add_argument("--fp8", action="store_true", help="Enable FP8 training")
-    parser.add_argument("--compile", action="store_true", default=True, help="torch.compile")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="torch.compile")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
 
     # Data
     parser.add_argument("--data-dir", type=str, default="data/dclm", help="Data directory")
 
     # Logging
-    parser.add_argument("--wandb", action="store_true", default=True, help="Enable W&B")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Enable W&B")
     parser.add_argument("--wandb-project", type=str, default="slm", help="W&B project")
     parser.add_argument("--log-interval", type=int, default=10, help="Log interval")
 

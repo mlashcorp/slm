@@ -53,7 +53,6 @@ COMPUTE_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_d
 # AdamW Fused Kernel
 # =============================================================================
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,
     grad: Tensor,
@@ -140,7 +139,7 @@ def muon_step_fused(
     # Polar Express orthogonalization
     # Cast to bf16 for speed (fp16 has limited exponent range)
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
     if g.size(-2) > g.size(-1):
         # Tall matrix
@@ -222,8 +221,10 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
-    def _step_adamw(self, group: Dict) -> None:
-        """AdamW update for each param in the group."""
+    def _step_adamw(self, group: Dict, do_adam: bool = True) -> None:
+        """AdamW update for each param in the group. Skips update if do_adam=False."""
+        if not do_adam:
+            return
         for p in group['params']:
             if p.grad is None:
                 continue
@@ -311,11 +312,16 @@ class MuonAdamW(torch.optim.Optimizer):
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
-    def step(self):
-        """Perform one optimization step."""
+    def step(self, do_adam: bool = True):
+        """Perform one optimization step.
+
+        Args:
+            do_adam: If False, skip AdamW updates (Muon still runs). Used for
+                     odd-steps-only Adam (reference: do_adam = step % 2 == 1).
+        """
         for group in self.param_groups:
             if group['kind'] == 'adamw':
-                self._step_adamw(group)
+                self._step_adamw(group, do_adam=do_adam)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
             else:

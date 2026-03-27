@@ -2,19 +2,21 @@
 NanoChat GPT model implementation.
 
 Based on Karpathy's nanochat: https://github.com/karpathy/nanochat
+Gap-closed against KellerJordan/modded-nanogpt.
 
 Key features:
 - ReLU^2 activation (instead of GELU)
 - QK normalization (RMSNorm on Q/K)
-- Value embeddings (ResFormer-style)
+- Value embeddings (ResFormer-style, gate uses cat([x[:6], ve[:6]]))
 - Sliding window attention (SSSL pattern)
-- Per-layer scalars (resid_lambdas, x0_lambdas)
+- Per-layer scalars (resid_lambdas shape (L,2), post_lambdas (L,2), x0_lambdas, sa_lambdas (L,2))
 - Smear gate (bigram-like mixing)
-- Backout mechanism
-- Softcap logits
+- Attention output gate
+- Backout mechanism (at ~64% depth)
+- Skip connection + attention-free layer
+- Bigram embeddings
+- Softcap logits (shifted sigmoid: 23 * sigmoid((x+5)/7.5))
 - Untied embeddings
-
-This is a complete rewrite following nanochat's architecture exactly.
 """
 import math
 import torch
@@ -37,7 +39,7 @@ def norm(x: torch.Tensor) -> torch.Tensor:
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
-    
+
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16).
     """
@@ -52,11 +54,11 @@ def has_value_embed(layer_idx: int, n_layer: int) -> bool:
 
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply rotary position embeddings.
-    
+
     Args:
         x: (B, T, H, D) attention tensor
         cos, sin: (1, T, 1, D//2) rotary embeddings
-    
+
     Returns:
         Rotated tensor of same shape
     """
@@ -69,40 +71,42 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
 
 def precompute_rotary_embeddings(seq_len: int, head_dim: int, base: float = 100_000.0, device: torch.device = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """Precompute rotary position embeddings.
-    
+
     Args:
         seq_len: Maximum sequence length
         head_dim: Dimension per attention head
         base: RoPE base frequency
-    
+
     Returns:
         cos, sin tensors of shape (1, seq_len, 1, head_dim//2)
     """
     if device is None:
         device = torch.device("cpu")
-    
+
     # Compute inverse frequencies
     channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
     inv_freq = 1.0 / (base ** (channel_range / head_dim))
-    
+
     # Compute frequencies for each position
     t = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(t, inv_freq)
-    
+
     cos = freqs.cos().to(COMPUTE_DTYPE)
     sin = freqs.sin().to(COMPUTE_DTYPE)
-    
+
     # Add batch and head dims
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
-    
+
     return cos, sin
 
 
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention with:
     - QK normalization
-    - Value embeddings (ResFormer-style)
+    - Value embeddings (ResFormer-style, gate uses both x and ve)
+    - Attention output gate
+    - sa_lambdas scaling on projections
     - Sliding window support
     """
     def __init__(self, config: NanoChatConfig, layer_idx: int):
@@ -112,19 +116,26 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.num_kv_heads
         self.n_embd = config.hidden_size
         self.head_dim = config.head_dim
-        
+
         # Projections
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        
+
         # Value embedding gate (only on alternating layers)
+        # Gate input: cat([x[..., :6], ve[..., :6]]) = 12 channels total
         if config.use_value_embeds and has_value_embed(layer_idx, config.depth):
-            self.ve_gate = Linear(config.ve_gate_channels, self.n_kv_head, bias=False)
+            self.ve_gate = Linear(12, self.n_kv_head, bias=False)
         else:
             self.ve_gate = None
-    
+
+        # Attention output gate: sigmoid(linear(x[:12])) per head
+        if config.use_attn_gate:
+            self.attn_gate = Linear(12, self.n_head, bias=False)
+        else:
+            self.attn_gate = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -132,68 +143,74 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         window_size: Tuple[int, int],
+        sa_lam: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            x: (B, T, C) input tensor
-            ve: (B, T, kv_dim) value embedding (optional)
+            x: (B, T, C) input tensor (pre-normed)
+            ve: (B, T, kv_dim) value embedding (optional, flat)
             cos, sin: Rotary embeddings
             window_size: (left, right) tuple for sliding window
-        
+            sa_lam: (2,) per-sublayer scalars [qkv_scale, o_scale] or None
+
         Returns:
             (B, T, C) output tensor
         """
         B, T, C = x.size()
-        
-        # Project to Q, K, V
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        
-        # Value residual (ResFormer): mix in value embedding with learned gate
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate.in_features]))
-            v = v + gate.unsqueeze(-1) * ve
-        
+
+        # sa_lambdas scaling (default 1.0 if not provided)
+        qkv_scale = sa_lam[0] if sa_lam is not None else 1.0
+        o_scale = sa_lam[1] if sa_lam is not None else 1.0
+
+        # Project to Q, K, V (with sa_lambda scaling)
+        q = qkv_scale * self.c_q(x)
+        k = qkv_scale * self.c_k(x)
+        v = qkv_scale * self.c_v(x)
+
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim)
+        v = v.view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): gate uses cat([x[:6], ve[:6]])
+        if ve is not None and self.ve_gate is not None:
+            # ve is (B, T, kv_dim) — use first 6 channels before reshape
+            gate_input = torch.cat([x[..., :6], ve[..., :6]], dim=-1)  # (B, T, 12)
+            gate = 2 * torch.sigmoid(self.ve_gate(gate_input))          # (B, T, n_kv_head)
+            ve_r = ve.view(B, T, self.n_kv_head, self.head_dim)
+            v = v + gate.unsqueeze(-1) * ve_r
+
         # Apply rotary embeddings
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        
+
         # QK normalization
         q = norm(q)
         k = norm(k)
-        
+
         # Sharper attention (split scale between Q and K)
         q = q * 1.2
         k = k * 1.2
-        
-        # Flash Attention or SDPA fallback
+
         # Scale dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
-        
-        # Use PyTorch's scaled_dot_product_attention
-        # For sliding window, we use a custom mask
+
         if window_size[0] < T:  # Sliding window
-            # Create sliding window mask
             mask = torch.triu(
                 torch.ones(T, T, device=x.device, dtype=torch.bool),
                 diagonal=1
             )
-            # Add window constraint: can only attend to last window_size[0] tokens
             for i in range(T):
                 mask[i, :max(0, i - window_size[0])] = True
             attn_mask = mask.masked_fill(mask, float('-inf'))
             attn_mask = attn_mask.masked_fill(~mask, 0.0)
         else:
-            # Full causal attention
             attn_mask = None
-        
+
         # Reshape for attention: (B, H, T, D)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
+
         # Scaled dot-product attention
         y = F.scaled_dot_product_attention(
             q, k, v,
@@ -202,27 +219,33 @@ class CausalSelfAttention(nn.Module):
             is_causal=(attn_mask is None),
             scale=scale,
         )
-        
-        # Reshape back: (B, T, C)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        
-        # Output projection
-        y = self.c_proj(y)
-        
+
+        # Reshape back: (B, T, n_head, head_dim)
+        y = y.transpose(1, 2).contiguous()  # (B, T, n_head, head_dim)
+
+        # Attention output gate: per-head gating using first 12 channels of x
+        if self.attn_gate is not None:
+            gate = torch.sigmoid(self.attn_gate(x[..., :12]))  # (B, T, n_head)
+            y = y * gate.unsqueeze(-1)                          # (B, T, n_head, head_dim)
+
+        y = y.view(B, T, C)
+
+        # Output projection (with sa_lambda scaling)
+        y = o_scale * self.c_proj(y)
+
         return y
 
 
 class MLP(nn.Module):
     """MLP with ReLU^2 activation.
-    
+
     ReLU^2: ReLU(x)^2 = max(0, x)^2
-    This provides a different activation pattern than GELU.
     """
     def __init__(self, config: NanoChatConfig):
         super().__init__()
         self.c_fc = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.c_proj = Linear(config.intermediate_size, config.hidden_size, bias=False)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square()  # ReLU^2
@@ -231,12 +254,12 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block with pre-norm."""
+    """Transformer block (attn + mlp sub-modules, used by GPT directly)."""
     def __init__(self, config: NanoChatConfig, layer_idx: int):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-    
+
     def forward(
         self,
         x: torch.Tensor,
@@ -245,37 +268,39 @@ class Block(nn.Module):
         sin: torch.Tensor,
         window_size: Tuple[int, int],
     ) -> torch.Tensor:
-        # Attention with residual
+        # Standard residual (used externally; GPT.forward calls attn/mlp separately)
         x = x + self.attn(norm(x), ve, cos, sin, window_size)
-        # MLP with residual
         x = x + self.mlp(norm(x))
         return x
 
 
 class GPT(nn.Module):
-    """NanoChat GPT model.
-    
+    """NanoChat GPT model — gaps closed vs modded-nanogpt.
+
     Key features:
     - Untied embeddings (separate wte and lm_head)
     - RMSNorm after embedding
-    - Per-layer learnable scalars (resid_lambdas, x0_lambdas)
+    - Per-layer learnable scalars (resid_lambdas (L,2), post_lambdas (L,2), x0_lambdas, sa_lambdas (L,2))
     - Smear gate (bigram-like mixing)
-    - Backout mechanism
-    - Softcap logits
+    - Attention output gate
+    - Backout mechanism (~64% depth)
+    - Skip connection + attention-free layer
+    - Bigram embeddings
+    - Softcap logits (shifted sigmoid)
     - Value embeddings (ResFormer-style)
     """
     def __init__(self, config: NanoChatConfig, pad_vocab_size_to: int = 64):
         """Initialize model.
-        
+
         Note: This can run in meta device context for shape initialization.
         Actual weights are initialized in init_weights().
         """
         super().__init__()
         self.config = config
-        
+
         # Pad vocab for efficiency (DDP, tensor cores)
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
-        
+
         # Transformer layers
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.hidden_size),
@@ -283,21 +308,34 @@ class GPT(nn.Module):
                 Block(config, i) for i in range(config.depth)
             ]),
         })
-        
+
         # Untied LM head
         self.lm_head = Linear(config.hidden_size, padded_vocab_size, bias=False)
-        
-        # Per-layer learnable scalars
+
+        # Per-layer residual scalars: shape (depth, 2) — separate for attn and MLP
         if config.use_resid_lambdas:
-            self.resid_lambdas = nn.Parameter(torch.ones(config.depth))
+            self.resid_lambdas = nn.Parameter(torch.full((config.depth, 2), 1.1 ** 0.5))
         else:
-            self.register_buffer("resid_lambdas", torch.ones(config.depth), persistent=False)
-        
+            self.register_buffer("resid_lambdas", torch.full((config.depth, 2), 1.1 ** 0.5), persistent=False)
+
+        # Per-layer output magnitude: shape (depth, 2) — separate for attn and MLP
+        if config.use_post_lambdas:
+            self.post_lambdas = nn.Parameter(torch.ones(config.depth, 2))
+        else:
+            self.register_buffer("post_lambdas", torch.ones(config.depth, 2), persistent=False)
+
+        # Per-layer x0 blending
         if config.use_x0_lambdas:
             self.x0_lambdas = nn.Parameter(torch.zeros(config.depth))
         else:
             self.register_buffer("x0_lambdas", torch.zeros(config.depth), persistent=False)
-        
+
+        # Per-sublayer projection scalars: shape (depth, 2) — [qkv_scale, o_scale]
+        if config.use_sa_lambdas:
+            self.sa_lambdas = nn.Parameter(torch.tensor([[0.5, 1.0]] * config.depth, dtype=torch.float32))
+        else:
+            self.register_buffer("sa_lambdas", torch.tensor([[0.5, 1.0]] * config.depth, dtype=torch.float32), persistent=False)
+
         # Smear gate (bigram-like mixing)
         if config.use_smear:
             self.smear_gate = Linear(config.smear_gate_channels, 1, bias=False)
@@ -305,13 +343,21 @@ class GPT(nn.Module):
         else:
             self.smear_gate = None
             self.register_buffer("smear_lambda", torch.zeros(1), persistent=False)
-        
+
         # Backout (remove low-level features before final projection)
         if config.use_backout:
             self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
         else:
             self.register_buffer("backout_lambda", 0.2 * torch.ones(1), persistent=False)
-        
+
+        # Skip connection + attention-free layer
+        if config.use_skip_connection:
+            self.skip_gate = Linear(12, 1, bias=False)
+            self.skip_lambda = nn.Parameter(torch.tensor(-1.5))
+        else:
+            self.skip_gate = None
+            self.register_buffer("skip_lambda", torch.tensor(-1.5), persistent=False)
+
         # Value embeddings (ResFormer-style)
         if config.use_value_embeds:
             kv_dim = config.num_kv_heads * config.head_dim
@@ -322,17 +368,32 @@ class GPT(nn.Module):
             })
         else:
             self.value_embeds = None
-        
+
+        # Bigram embeddings
+        if config.use_bigram_embeds:
+            self.bigram_embed = nn.Embedding(config.bigram_vocab_size, config.hidden_size)
+            self.bigram_lambdas = nn.Parameter(torch.full((config.depth,), 0.05))
+            # Fixed random hash coefficients (reproducible)
+            rng = torch.Generator()
+            rng.manual_seed(42)
+            rand1 = torch.randint(1, 2 ** 31, (1,), dtype=torch.long, generator=rng)
+            rand2 = torch.randint(1, 2 ** 31, (1,), dtype=torch.long, generator=rng)
+            self.register_buffer("bigram_rand1", rand1, persistent=True)
+            self.register_buffer("bigram_rand2", rand2, persistent=True)
+        else:
+            self.bigram_embed = None
+            self.register_buffer("bigram_lambdas", torch.zeros(config.depth), persistent=False)
+
         # Precompute rotary embeddings (10x over-provision for safety)
         rotary_seq_len = config.sequence_len * 10
         cos, sin = precompute_rotary_embeddings(rotary_seq_len, config.head_dim, config.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
-    
+
     @torch.no_grad()
     def init_weights(self):
         """Initialize model weights.
-        
+
         Weight initialization strategy from nanochat:
         - Embedding: normal, std=0.8
         - LM head: normal, std=0.001 (small!)
@@ -340,16 +401,18 @@ class GPT(nn.Module):
         - Attention output: zeros
         - MLP up: uniform with std = 0.4 * sqrt(3/d)
         - MLP down: zeros
+        - attn_gate: zeros (gate starts at 0.5 = no effect)
+        - skip_gate: zeros (gate starts small)
         """
         n_embd = self.config.hidden_size
         s = math.sqrt(3) * n_embd ** -0.5  # Uniform std = sqrt(3) * normal_std
-        
+
         # Embedding
         nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        
+
         # LM head (small init!)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        
+
         # Transformer blocks
         for block in self.transformer.h:
             # Attention
@@ -357,70 +420,70 @@ class GPT(nn.Module):
             nn.init.uniform_(block.attn.c_k.weight, -s, s)
             nn.init.uniform_(block.attn.c_v.weight, -s, s)
             nn.init.zeros_(block.attn.c_proj.weight)
-            
+
+            # Attention output gate: zeros → sigmoid(0) = 0.5 initial gate
+            if block.attn.attn_gate is not None:
+                nn.init.zeros_(block.attn.attn_gate.weight)
+
             # MLP
             nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
             nn.init.zeros_(block.mlp.c_proj.weight)
-        
+
         # Per-layer scalars
-        n_layer = self.config.depth
-        if self.config.use_resid_lambdas:
-            # Decaying residual: stronger at early layers
-            for i in range(n_layer):
-                self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        
         if self.config.use_x0_lambdas:
-            # Decaying x0: earlier layers blend more of initial embedding
+            n_layer = self.config.depth
             for i in range(n_layer):
                 self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
-        
+
+        # Skip gate: zeros → skip starts with small effect
+        if self.skip_gate is not None:
+            nn.init.zeros_(self.skip_gate.weight)
+
         # Value embeddings
         if self.value_embeds is not None:
             for ve in self.value_embeds.values():
                 nn.init.uniform_(ve.weight, -s, s)
-        
+
+        # Bigram embeddings: small init
+        if self.bigram_embed is not None:
+            nn.init.normal_(self.bigram_embed.weight, mean=0.0, std=0.02)
+
         # Smear gate
         if self.smear_gate is not None:
             nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
-        
+
         # Cast embeddings to compute dtype (optimizer handles precision)
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.weight.data = self.transformer.wte.weight.data.to(COMPUTE_DTYPE)
             if self.value_embeds is not None:
                 for ve in self.value_embeds.values():
                     ve.weight.data = ve.weight.data.to(COMPUTE_DTYPE)
-    
+            if self.bigram_embed is not None:
+                self.bigram_embed.weight.data = self.bigram_embed.weight.data.to(COMPUTE_DTYPE)
+
     def _compute_window_sizes(self) -> list:
-        """Compute per-layer window sizes for sliding window attention.
-        
-        Returns list of (left, right) tuples:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after (0 for causal)
-        
-        Pattern is tiled across layers. Final layer always gets full context.
-        """
+        """Compute per-layer window sizes for sliding window attention."""
         pattern = self.config.window_pattern.upper()
         T = self.config.sequence_len
-        
-        # Map pattern chars to window sizes
+
         long_window = T
         short_window = -(-T // 4 // 128) * 128  # Ceil to FA3 tile size
-        
+
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
         }
-        
+
         window_sizes = []
         for layer_idx in range(self.config.depth):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
-        
+
         # Final layer always gets full context
         window_sizes[-1] = (long_window, 0)
-        
+
         return window_sizes
-    
+
     def forward(
         self,
         idx: torch.Tensor,
@@ -430,76 +493,110 @@ class GPT(nn.Module):
         Args:
             idx: (B, T) input token indices
             targets: (B, T) target tokens for loss computation
-        
+
         Returns:
             If targets provided: loss scalar
             Otherwise: (B, T, vocab_size) logits
         """
         B, T = idx.size()
-        
+
         # Get rotary embeddings for current sequence length
         assert T <= self.rope_cos.size(1), f"Sequence {T} exceeds rotary cache {self.rope_cos.size(1)}"
         cos = self.rope_cos[:, :T]
         sin = self.rope_sin[:, :T]
-        
+
         # Embed tokens
         x = self.transformer.wte(idx)
         x = x.to(COMPUTE_DTYPE)
         x = norm(x)  # Norm after embedding (nanochat style)
-        
+
         # Smear: mix previous token's embedding into current position
         if self.smear_gate is not None and T > 1:
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
                 self.smear_gate(x[:, 1:, :self.config.smear_gate_channels])
             )
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        
+
         # Save initial embedding for x0 blending
         x0 = x
-        
-        # Backout: cache mid-layer residual
-        backout_layer = self.config.depth // 2
+
+        # Compute bigram embeddings
+        if self.bigram_embed is not None:
+            tok = idx.long()
+            prev = torch.cat([tok[:, :1], tok[:, :-1]], dim=1)
+            bigram_idx = (self.bigram_rand1 * tok ^ self.bigram_rand2 * prev) % (self.config.bigram_vocab_size - 1)
+            x0_bigram = self.bigram_embed(bigram_idx).to(x.dtype)  # (B, T, C)
+        else:
+            x0_bigram = None
+
+        # Backout: cache at ~64% depth (7/11 ≈ 63.6%)
+        backout_layer = round(self.config.depth * 7 / 11)
         x_backout = None
-        
+
         # Window sizes for sliding window attention
         window_sizes = self._compute_window_sizes()
-        
+
+        # Skip connection state
+        skip_connection = None
+        cfg = self.config
+
         # Transformer layers
         for i, block in enumerate(self.transformer.h):
-            # Residual scaling
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            
+            # x0 injection (initial embedding + bigram)
+            x0_inject = self.x0_lambdas[i] * x0
+            if x0_bigram is not None:
+                x0_inject = x0_inject + self.bigram_lambdas[i] * x0_bigram
+
             # Value embedding (ResFormer-style)
             if self.value_embeds is not None and str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](idx).to(x.dtype)
             else:
                 ve = None
-            
-            # Transformer block
-            x = block(x, ve, cos, sin, window_sizes[i])
-            
+
+            # sa_lambdas for this layer
+            sa_lam = self.sa_lambdas[i] if cfg.use_sa_lambdas else None
+
+            # Save skip source
+            if cfg.use_skip_connection and i == cfg.skip_source_layer:
+                skip_connection = x
+
+            # Skip-target layer: replace attention with skip gate injection
+            if cfg.use_skip_connection and i == cfg.skip_target_layer and skip_connection is not None:
+                gate_val = torch.sigmoid(self.skip_lambda) * torch.sigmoid(
+                    self.skip_gate(x[..., :12])
+                )  # (B, T, 1)
+                skip_out = gate_val * skip_connection  # (B, T, C)
+                x = self.resid_lambdas[i, 0] * x + self.post_lambdas[i, 0] * skip_out + x0_inject
+                mlp_out = block.mlp(norm(x))
+                x = self.resid_lambdas[i, 1] * x + self.post_lambdas[i, 1] * mlp_out
+            else:
+                # Normal transformer block — call attn and mlp separately
+                attn_out = block.attn(norm(x), ve, cos, sin, window_sizes[i], sa_lam)
+                x = self.resid_lambdas[i, 0] * x + self.post_lambdas[i, 0] * attn_out + x0_inject
+                mlp_out = block.mlp(norm(x))
+                x = self.resid_lambdas[i, 1] * x + self.post_lambdas[i, 1] * mlp_out
+
             # Cache mid-layer for backout
             if i == backout_layer:
                 x_backout = x
-        
+
         # Backout: subtract mid-layer residual to remove low-level features
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        
+
         # Final norm
         x = norm(x)
-        
+
         # LM head
         logits = self.lm_head(x)
-        
+
         # Slice to remove padding
         logits = logits[..., :self.config.vocab_size]
-        
-        # Softcap logits
+
+        # Softcap logits: shifted sigmoid (modded-nanogpt style)
         logits = logits.float()
-        softcap = self.config.logit_softcap
-        logits = softcap * torch.tanh(logits / softcap)
-        
+        logits = 23.0 * torch.sigmoid((logits + 5.0) / 7.5)
+
         # Compute loss if targets provided
         if targets is not None:
             loss = F.cross_entropy(
@@ -508,51 +605,52 @@ class GPT(nn.Module):
                 ignore_index=-1,
             )
             return loss
-        
+
         return logits
-    
+
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count model parameters."""
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
-    
+
     def estimate_flops_per_token(self) -> int:
         """Estimate FLOPs per token (forward + backward).
-        
+
         Each matmul weight parameter contributes 6 FLOPs:
         - 2 in forward (multiply, accumulate)
         - 4 in backward (2 for input grad, 2 for weight grad)
-        
-        Plus attention FLOPs: 12 * H * D * effective_seq_len
         """
         nparams = self.num_parameters()
-        
+
         # Exclude non-matmul params
         wte = self.transformer.wte.weight.numel()
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values()) if self.value_embeds else 0
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        bigram_numel = self.bigram_embed.weight.numel() if self.bigram_embed else 0
+        scalars = (self.resid_lambdas.numel() + self.post_lambdas.numel() +
+                   self.x0_lambdas.numel() + self.sa_lambdas.numel() +
+                   self.bigram_lambdas.numel())
         if self.smear_gate is not None:
             scalars += self.smear_gate.weight.numel() + self.smear_lambda.numel()
         scalars += self.backout_lambda.numel()
-        
-        nparams_exclude = wte + value_embeds_numel + scalars
-        
+
+        nparams_exclude = wte + value_embeds_numel + bigram_numel + scalars
+
         # Attention FLOPs (accounting for sliding window)
         H = self.config.num_heads
         D = self.config.head_dim
         T = self.config.sequence_len
-        
+
         attn_flops = 0
         window_sizes = self._compute_window_sizes()
         for window_size in window_sizes:
             window = window_size[0]
             effective_seq = T if window < 0 else min(window, T)
             attn_flops += 12 * H * D * effective_seq
-        
+
         flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return flops_per_token
-    
+
     @torch.no_grad()
     def generate(
         self,
@@ -562,40 +660,29 @@ class GPT(nn.Module):
         top_k: Optional[int] = None,
         seed: int = 42,
     ) -> list:
-        """Naive autoregressive generation.
-        
-        Args:
-            tokens: List of input token ids
-            max_tokens: Number of tokens to generate
-            temperature: Sampling temperature (0 = greedy)
-            top_k: Top-k sampling
-            seed: Random seed for reproducibility
-        
-        Yields:
-            Generated tokens one at a time
-        """
+        """Naive autoregressive generation."""
         device = next(self.parameters()).device
-        
+
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        
+
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        
+
         for _ in range(max_tokens):
             logits = self.forward(ids)
             logits = logits[:, -1, :]
-            
+
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
-            
+
             if temperature > 0:
                 logits = logits / temperature
                 probs = F.softmax(logits, dim=-1)
                 next_id = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
-            
+
             ids = torch.cat([ids, next_id], dim=1)
             yield next_id.item()

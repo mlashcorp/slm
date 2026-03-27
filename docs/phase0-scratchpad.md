@@ -2,32 +2,106 @@
 
 ## Goal
 
-Recreate Karpathy's nanochat approach to achieve GPT-2 capability (CORE score > 0.26) in ~3-5 hours on RTX 5090.
+Recreate Karpathy's nanogpt approach with modern improvements to achieve GPT-2 capability (CORE score > 0.26) in ~3-5 hours on RTX 5090.
 
-## Key Decisions
+## Reference
 
-1. ✅ **New files** - Clean separation from Phase 1-3
-2. ✅ **New tokenizer** - Train on DCLM (vocab=32768)
-3. ✅ **Validate with d12** - Quick 100-step test before full run
-4. ✅ **FP8 training** - Enable for speed
-5. ✅ **Same W&B project** - Use `phase0_d{depth}` prefix
+**Base**: https://github.com/karpathy/nanogpt — the original minimal GPT-2 reimplementation this builds on
+**Muon optimizer**: https://kellerjordan.github.io/posts/muon/
+**Polar Express**: https://arxiv.org/pdf/2505.16932
+**Dataset**: `data/python_edu_hydrated_train_split` (7.6M rows, converted to parquet)
 
-## Architecture Comparison
+---
 
-| Feature | Phase 1 (SmolLM2) | Phase 0 (NanoChat) |
-|---------|-------------------|-------------------|
-| Activation | GELU | ReLU² |
-| QK Normalization | No | Yes (RMSNorm) |
-| Value Embeddings | No | Yes (ResFormer-style) |
-| Sliding Window | No | Yes (SSSL pattern) |
-| Tied Embeddings | Yes | No (untied) |
-| Norm After Embed | No | Yes |
-| Per-layer Scalars | No | Yes (resid_lambdas, x0_lambdas) |
-| Smear Gate | No | Yes (bigram-like) |
-| Backout | No | Yes |
-| Softcap Logits | No | Yes (±15) |
-| Optimizer | AdamW | MuonAdamW |
-| Precision | BF16 | FP8 (optional) |
+## Architecture: What We Changed vs karpathy/nanogpt
+
+karpathy/nanogpt is a clean GPT-2 baseline: LayerNorm, absolute position embeddings, GELU, tied weights, AdamW.
+Below is what we changed and added on top.
+
+| Feature | karpathy/nanogpt | Ours | Status |
+|---------|-----------------|------|--------|
+| Norm type | LayerNorm (learned) | RMSNorm (no params) | ✅ |
+| Position encoding | Absolute (wpe) | RoPE | ✅ |
+| Activation | GELU | ReLU² | ✅ |
+| Tied embeddings | Yes | No (untied) | ✅ |
+| Norm after embed | No | Yes | ✅ |
+| QK normalization | No | Yes (RMSNorm on Q, K) | ✅ |
+| Sliding window attn | No | Yes (SSSL pattern) | ✅ |
+| Value embeddings | No | Yes (ResFormer-style) | ✅ |
+| VE gate | — | `2 * sigmoid(linear(cat([x[:6], ve[:6]])))` | ✅ |
+| Per-layer resid_lambdas | No | `(L, 2)` — attn + MLP | ✅ |
+| Per-layer post_lambdas | No | `(L, 2)` — attn + MLP | ✅ |
+| Per-layer x0_lambdas | No | `(L,)` — blend initial embed | ✅ |
+| Per-layer sa_lambdas | No | `(L, 2)` — scale QKV + O | ✅ |
+| Smear gate | No | Yes (bigram-like mixing) | ✅ |
+| Attention output gate | No | `y * sigmoid(linear(x[:12]))` per head | ✅ |
+| Skip connection | No | Layer 3 → 6, layer 6 skips attn | ✅ |
+| Bigram embeddings | No | Hash-based, injected per layer | ✅ |
+| Backout | No | Subtract cached mid-stream at ~64% depth | ✅ |
+| Softcap logits | No | `23 * sigmoid((logits + 5) / 7.5)` | ✅ |
+| Optimizer | AdamW | MuonAdamW (Muon for matrices) | ✅ |
+| Adam odd-steps | No | Adam only on odd steps | ✅ |
+| Polar Express cushion | — | `1 + 2e-2` | ✅ |
+| Dropout | Yes (0.0 for pretrain) | No | ✅ |
+| Vocab size | 50304 | 50304 (r50k_base) | ✅ |
+
+### Deferred (Phase 5)
+
+| Feature | Notes |
+|---------|-------|
+| YaRN RoPE | Half-truncated, base `(1/1024)^linspace`, `attn_scale=0.1` |
+| Paired head layers | Adjacent heads attend to interleaved doubled sequences |
+| MTP | Multi-token prediction heads with `[1.0, 0.5, 0.25]` weights |
+| Mantissa tracking | uint16 mantissa buffer for BF16 precision in Muon |
+
+---
+
+## Implementation Status
+
+All Phase 1–4 items from the plan are complete. End-to-end smoke test passes.
+
+```
+✅ Bug: tokenizer cl100k_base → r50k_base, vocab_size 32768 → 50304
+✅ Bug: doc_iter nonlocal in refill_buffer()
+✅ Bug: initial_lr stored after optimizer creation
+✅ Bug: --compile / --wandb use BooleanOptionalAction
+✅ Arch: VE gate uses cat([x[:6], ve[:6]]) with 2× multiplier
+✅ Arch: backout_layer = round(depth * 7/11)
+✅ Arch: resid_lambdas (L,2), post_lambdas (L,2)
+✅ Arch: logit softcap = 23 * sigmoid((x+5)/7.5)
+✅ Arch: Polar Express cushion 1.02
+✅ Feature: sa_lambdas
+✅ Feature: attention output gate (init zeros)
+✅ Feature: skip connection + attention-free layer
+✅ Feature: bigram embeddings
+✅ Training: Adam odd-steps-only
+✅ Training: final_lr_frac 0.15
+✅ Training: momentum peak 0.95, warmup 300 steps, cooldown to 0.85
+```
+
+---
+
+## Training Configuration
+
+```yaml
+# Optimizer — AdamW
+unembedding_lr: 0.008
+embedding_lr:   0.2
+scalar_lr:      0.5
+
+# Optimizer — Muon
+matrix_lr:      0.02
+momentum:       0.95         # warms up 0.85→0.95 over 300 steps
+weight_decay:   0.28
+beta2:          0.9
+
+# Schedule
+warmup_steps:   40
+warmdown_ratio: 0.65
+final_lr_frac:  0.15         # final LR = 15% of peak
+```
+
+---
 
 ## Model Sizes
 
@@ -37,52 +111,7 @@ Recreate Karpathy's nanochat approach to achieve GPT-2 capability (CORE score > 
 | d24 | 24 | 512 | 4 | ~50M | 2-5B | GPT-2 level |
 | d26 | 26 | 640 | 5 | ~60M | 3-5B | Beat GPT-2 |
 
-## Training Configuration
-
-### Hyperparameters (from nanochat)
-
-```yaml
-# Optimizer - AdamW params
-unembedding_lr: 0.008
-embedding_lr: 0.2
-scalar_lr: 0.5
-
-# Optimizer - Muon params
-matrix_lr: 0.02
-momentum: 0.95
-weight_decay: 0.28
-
-# Training
-warmup_steps: 40
-warmdown_ratio: 0.65
-final_lr_frac: 0.05
-target_param_data_ratio: 8
-
-# Compute
-fp8: true
-compile: true
-```
-
-### Learning Rate Schedule
-
-```
-Phase 1: Warmup (40 steps)
-  LR: 0 → peak (linear)
-
-Phase 2: Stable (remaining steps - warmdown)
-  LR: peak (constant)
-
-Phase 3: Warmdown (65% of training from end)
-  LR: peak → peak * 0.05 (linear)
-```
-
-### Momentum Schedule (Muon)
-
-```
-Steps 0-400: 0.85 → 0.97 (warmup)
-Steps 400-warmdown: 0.97 (stable)
-Warmdown: 0.97 → 0.90 (decay)
-```
+---
 
 ## File Structure
 
@@ -90,246 +119,78 @@ Warmdown: 0.97 → 0.90 (decay)
 slm/
 ├── src/
 │   ├── model/
-│   │   ├── nanochat_config.py    # Config (d12, d24, d26)
-│   │   └── nanochat_gpt.py       # Model implementation
+│   │   ├── nanochat_config.py
+│   │   └── nanochat_gpt.py
 │   ├── training/
-│   │   ├── fp8.py                 # FP8 Linear layer
-│   │   └── muon_optimizer.py      # MuonAdamW optimizer
+│   │   ├── fp8.py
+│   │   └── muon_optimizer.py
 │   └── data/
-│       └── bos_bestfit.py         # BOS-aligned best-fit loader
+│       └── bos_bestfit.py
 ├── scripts/
-│   ├── train_phase0.py            # Training script
-│   ├── eval_core.py               # CORE metric evaluation
-│   └── download_dclm.py           # DCLM download
+│   ├── train_phase0.py
+│   ├── eval_core.py
+│   └── download_dclm.py
 ├── data/
-│   └── dclm/                      # DCLM dataset
+│   ├── dclm/                         # parquet shards for training
+│   ├── python_edu_hydrated_train_split/
+│   └── python_edu_hydrated_val_split/
 └── checkpoints/
-    └── phase0/
-        └── d{depth}/
+    └── phase0/d{depth}/
 ```
 
-## Dataset: DCLM
+---
 
-### What is DCLM?
+## Data
 
-Data Comp for Language Models (DCLM) is a high-quality pretraining dataset used by nanochat.
-
-### Download
+Currently using `python_edu` converted to parquet (`data/dclm/`).
+For a proper pretraining run, download DCLM:
 
 ```bash
-# Download 8 shards for tokenizer training (~2B chars)
-python scripts/download_dclm.py -n 8
-
-# Download 170 shards for full training (~42B chars)
-python scripts/download_dclm.py -n 170
+python scripts/download_dclm.py -n 170   # ~42B chars, 170 shards
 ```
 
-### Data Loading: BOS-Aligned Best-Fit
-
-Key properties:
-- Every sequence starts with BOS token
-- Best-fit cropping: find largest doc that fits
-- 100% utilization (no padding)
-- ~35% tokens cropped (but all trained on)
-
-Algorithm:
-```
-for each row:
-    while pos < row_capacity:
-        # Find largest doc that fits
-        best = max(docs, key=len) if len(max) <= remaining
-        if best:
-            row[pos:pos+len(best)] = best
-        else:
-            # Crop shortest to fill
-            row[pos:] = shortest[:remaining]
-```
-
-## FP8 Training
-
-### How it Works
-
-FP8 training uses 8-bit floating point for matmuls:
-
-1. **Forward**: `output = input @ weight.T`
-   - Quantize input and weight to `float8_e4m3fn` (high precision)
-   - Call `torch._scaled_mm` (cuBLAS FP8 kernel)
-   - Dequantize output
-
-2. **Backward**: Two matmuls
-   - `grad_input = grad_output @ weight` (e5m2 for gradients)
-   - `grad_weight = grad_output.T @ input`
-
-### FP8 Data Types
-
-| Type | Exponent | Mantissa | Range | Usage |
-|------|----------|----------|-------|-------|
-| `float8_e4m3fn` | 4 bits | 3 bits | [-448, 448] | Input, weight |
-| `float8_e5m2` | 5 bits | 2 bits | [-57344, 57344] | Gradients |
-
-### Hardware Support
-
-- **H100+ (Hopper)**: Native FP8 support
-- **RTX 5090 (Blackwell)**: Native FP8 support (SM 100+)
-- **Fallback**: Use BF16 if FP8 not available
-
-## Muon Optimizer
-
-### Key Components
-
-1. **Nesterov Momentum**: Smooth gradients
-2. **Polar Express**: Orthogonalize update (5 Newton-Schulz iterations)
-3. **Variance Reduction**: Per-neuron adaptive LR
-4. **Cautious Weight Decay**: Only when gradient and param have same sign
-
-### Parameter Groups
-
-```python
-param_groups = [
-    # AdamW: embeddings, scalars
-    dict(kind='adamw', params=lm_head, lr=0.008),
-    dict(kind='adamw', params=embeddings, lr=0.2),
-    dict(kind='adamw', params=scalars, lr=0.5),
-
-    # Muon: matrix params (same shape for stacking)
-    dict(kind='muon', params=matrices, lr=0.02, momentum=0.95),
-]
-```
-
-### Why Muon?
-
-- Faster convergence for transformers
-- Better scaling properties
-- Used in nanochat's GPT-2 reproduction
-
-## CORE Metric
-
-### What is CORE?
-
-DCLM benchmark suite for evaluating model quality:
-- HellaSwag
-- PIQA
-- ARC (Easy and Challenge)
-- Winogrande
-- MMLU
-
-### Baseline Scores
-
-| Model | CORE Score | Parameters |
-|-------|------------|------------|
-| GPT-2 (1.5B) | 0.2565 | 1.5B |
-| NanoChat d24 | 0.2585 | ~50M |
-| NanoChat d26 | 0.2626 | ~60M |
-
-### Evaluation
-
-```bash
-# Full evaluation with lm-eval
-lm_eval --model hf --model_args path/to/model --tasks hellaswag,piqa,arc_easy,arc_challenge,winogrande,mmlu
-
-# Custom evaluation
-python scripts/eval_core.py --checkpoint checkpoints/phase0/d24/final.pt
-```
+---
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
-pip install tiktoken lm-eval
+# Smoke test (10 steps)
+.venv/bin/python scripts/train_phase0.py \
+    --depth 12 --num-iterations 10 --batch-size 2 \
+    --no-wandb --no-compile --data-dir data/dclm
+
+# Validation (d12, 100 steps)
+.venv/bin/python scripts/train_phase0.py \
+    --depth 12 --num-iterations 100 --batch-size 4 \
+    --no-wandb --data-dir data/dclm
+
+# Full training (d24)
+.venv/bin/python scripts/train_phase0.py \
+    --depth 24 --fp8 --batch-size 16 \
+    --wandb --data-dir data/dclm
 ```
 
-### 2. Download Data
+---
+
+## CORE Metric
+
+Evaluated on: HellaSwag, PIQA, ARC-Easy, ARC-Challenge, Winogrande, MMLU
+
+| Model | CORE | Params |
+|-------|------|--------|
+| GPT-2 (1.5B) | 0.2565 | 1.5B |
+| Target d24 | >0.26 | ~50M |
 
 ```bash
-python scripts/download_dclm.py -n 170
+python scripts/eval_core.py --checkpoint checkpoints/phase0/d24/final.pt
 ```
 
-### 3. Quick Validation (d12, 100 steps)
+---
 
-```bash
-python scripts/train_phase0.py \
-    --depth 12 \
-    --num-iterations 100 \
-    --batch-size 4 \
-    --wandb
-```
+## Expected Timeline (RTX 5090)
 
-### 4. Full Training (d24)
-
-```bash
-python scripts/train_phase0.py \
-    --depth 24 \
-    --fp8 \
-    --compile \
-    --batch-size 16 \
-    --wandb
-```
-
-## Expected Timeline
-
-| Phase | Tokens | Time (RTX 5090) | CORE Target |
-|-------|--------|-----------------|-------------|
-| Validation (d12) | 100M | ~5 min | N/A |
-| d24 (2B tokens) | 2B | ~5 hours | >0.20 |
-| d24 (5B tokens) | 5B | ~12 hours | >0.26 |
-
-## Known Issues
-
-### 1. Memory Error with torch.compile
-
-The compiled kernels may cause memory corruption on some systems.
-
-**Workaround**: Disable compile
-```bash
-python scripts/train_phase0.py --depth 12 --no-compile
-```
-
-### 2. FP8 Not Supported
-
-**Error**: "FP8 not supported"
-
-**Solution**: Ensure RTX 5090 or H100+ GPU. Fallback to BF16.
-
-### 3. Dataset Not Found
-
-**Error**: "Data directory not found"
-
-**Solution**: Download DCLM first
-```bash
-python scripts/download_dclm.py -n 8
-```
-
-## Success Criteria
-
-| Milestone | Target | Verification |
-|-----------|--------|--------------|
-| Model compiles | No errors | `python -c "from src.model.nanochat_gpt import GPT"` |
-| Forward pass | Output shape correct | Test script |
-| Optimizer step | Loss decreases | 10-step test |
-| d12 validation | Loss < 3.0 in 100 steps | W&B |
-| d24 full run | CORE > 0.26 | lm-eval |
-
-## Reference Links
-
-- **NanoChat repo**: https://github.com/karpathy/nanochat
-- **NanoChat paper**: arXiv:2502.02737 (SmolLM2)
-- **Muon optimizer**: https://kellerjordan.github.io/posts/muon/
-- **DCLM dataset**: https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0-parquet
-- **Polar Express**: https://arxiv.org/pdf/2505.16932
-
-## Notes
-
-- The NanoChat architecture is significantly different from SmolLM2
-- Key innovations: QK norm, value embeddings, smear gate, backout
-- FP8 training requires H100+ or RTX 5090 (Blackwell)
-- Muon optimizer is critical for fast convergence
-- Training with data:param ratio of 8 (vs 20 Chinchilla optimal)
-
-## Next Steps
-
-1. Test on RTX 5090 with CUDA
-2. Debug any torch.compile issues
-3. Run d12 validation (100 steps)
-4. If successful, proceed to d24 full training
-5. Evaluate CORE metric and compare to nanochat leaderboard
+| Run | Tokens | Time | Purpose |
+|-----|--------|------|---------|
+| d12, 100 steps | ~400K | <5 min | Sanity check |
+| d24, 2B tokens | 2B | ~5 hours | First CORE eval |
+| d24, 5B tokens | 5B | ~12 hours | Target CORE > 0.26 |
