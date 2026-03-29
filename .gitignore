@@ -10,3 +10,7 @@ __pycache__/
 /logs/
 /wandb/
 /evals/
+
+# Verbatim copies of external projects
+/phase0/
+/phase0.5/
