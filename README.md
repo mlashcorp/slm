@@ -24,6 +24,26 @@ Llama-style decoder-only transformer with:
 
 All phases use the **SmolLM2 49K BPE tokenizer** extended with 4 FIM tokens (vocab size 49,156).
 
+## Phase 5 — nanochat Baseline (Active)
+
+A parallel experiment track using [karpathy/nanochat](https://github.com/karpathy/nanochat) as the training framework to rapidly iterate on architecture and data mixture ideas before committing them to the full Llama-based pipeline.
+
+**Current run:** nanochat depth=12 (~124M params), 715 steps on ClimbMix-400B (25 shards, ~1.53B tokens).
+
+| Field | Value |
+|-------|-------|
+| **W&B** | https://wandb.ai/mlashcorp/nanochat/runs/xljut36a |
+| **Instance** | Vast.ai RTX 3090 @ $0.11/hr |
+| **Details** | `phase5/baseline/README.md` |
+
+**Planned experiments (ranked by expected gain / complexity):**
+
+1. Data mixture sweep — add python-edu, sweep Python % ratios
+2. AST-FIM — syntax-aware fill-in-middle objective
+3. CAG — contextual action gating (free retrieval decision)
+4. TOP — token order prediction auxiliary objective
+5. XMoE — sparse expert routing (50% compute reduction)
+
 ## Project Layout
 
 ```

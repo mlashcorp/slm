@@ -1,0 +1,37 @@
+gpu:
+  type: "RTX 5090"
+  count: 1
+  min_vram_gb: 24
+
+instance:
+  image: "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
+  disk_gb: 140
+
+project:
+  local_path: "/home/ubuntu/code/slm"
+  remote_path: "/workspace/slm"
+  exclude:
+    - "__pycache__"
+    - "*.pyc"
+    - ".git"
+    - "*.egg-info"
+    - ".venv"
+    - "data"
+    - "checkpoints"
+
+r2:
+  bucket: "ml-datasets"
+  mount_path: "/workspace/datasets"
+  sync_subdir: "phase5/e2e/nanochat"
+
+run_id: "phase5_canary"
+
+training:
+  command: "bash phase5/canary/remote_nanochat_canary.sh"
+  tmux_session: "train"
+
+wandb:
+  project: "slm-phase5-canary"
+
+hf:
+  repo: "mlashcorp/slm-phase5-checkpoints"
